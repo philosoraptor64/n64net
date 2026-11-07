@@ -72,7 +72,9 @@ def is_private(addr):
 
 
 def valid_code(code):
-    return len(code) == CODE_LEN and all(c in CODE_ALPHABET for c in code)
+    # Random codes avoid look-alikes (CODE_ALPHABET); codes players choose
+    # themselves may use any letter or digit.
+    return len(code) == CODE_LEN and code.isascii() and code.isalnum()
 
 
 class Room:
