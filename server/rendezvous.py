@@ -32,7 +32,7 @@ password answers bad or missing signatures with "ERR auth" and ignores an
 address after repeated failures.
 
 Usage: rendezvous.py [--port 7780] [--bind 0.0.0.0] [--public-ip A.B.C.D]
-                     [--password-file PATH]
+                     [--password-file PATH] [--natpmp]
 Stdlib only, Python 3.8+.
 """
 import argparse
@@ -42,6 +42,8 @@ import hmac
 import ipaddress
 import logging
 import secrets
+import socket
+import struct
 import time
 
 PREFIX = b"N64R1 "
@@ -288,12 +290,80 @@ class Rendezvous(asyncio.DatagramProtocol):
                 self.drop_room(room, "idle")
 
 
+NATPMP_PORT = 5351
+NATPMP_LIFETIME = 3600       # seconds; renewed at half-life
+
+
+def natpmp_map(gateway, port, lifetime):
+    """Ask a home router (NAT-PMP, RFC 6886) to forward UDP `port` to this
+    machine. lifetime=0 removes the mapping. Returns the granted lifetime,
+    or None if the router did not answer or refused."""
+    req = struct.pack("!BBHHHI", 0, 1, 0, port, port if lifetime else 0, lifetime)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        timeout = 0.25
+        for _ in range(4):  # RFC 6886 retry schedule, shortened
+            sock.settimeout(timeout)
+            sock.sendto(req, (gateway, NATPMP_PORT))
+            try:
+                data, _ = sock.recvfrom(16)
+            except socket.timeout:
+                timeout *= 2
+                continue
+            if len(data) < 16:
+                return None
+            _ver, op, result, _epoch, _internal, external, granted = struct.unpack("!BBHIHHI", data)
+            if op != 129 or result != 0:
+                log.warning("router refused the port mapping (NAT-PMP result %d)", result)
+                return None
+            if lifetime and external != port:
+                log.warning("router mapped external port %d instead of %d", external, port)
+            return granted
+        return None
+    finally:
+        sock.close()
+
+
+def default_gateway():
+    """IPv4 default gateway (macOS/BSD `route`, Linux /proc)."""
+    try:
+        import subprocess
+        out = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if line.strip().startswith("gateway:"):
+                return line.split(":", 1)[1].strip()
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                fields = line.split()
+                if fields[1] == "00000000":
+                    return socket.inet_ntoa(struct.pack("<I", int(fields[2], 16)))
+    except OSError:
+        pass
+    return None
+
+
+async def keep_port_mapped(gateway, port):
+    while True:
+        granted = await asyncio.get_running_loop().run_in_executor(None, natpmp_map, gateway, port, NATPMP_LIFETIME)
+        if granted:
+            log.info("router %s forwards UDP %d here (NAT-PMP, renewing)", gateway, port)
+            await asyncio.sleep(max(60, granted // 2))
+        else:
+            log.warning("NAT-PMP port mapping failed; players outside this network cannot connect")
+            await asyncio.sleep(60)
+
+
 async def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7780)
     ap.add_argument("--public-ip", help="this network's public IP, when hosting behind a home router")
     ap.add_argument("--password-file", help="file whose first line is the server password")
+    ap.add_argument("--natpmp", action="store_true",
+                    help="ask the home router (NAT-PMP) to forward the port while running")
     ap.add_argument("-v", "--verbose", action="store_true")
     opts = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if opts.verbose else logging.INFO,
@@ -310,16 +380,33 @@ async def main():
     log.info("n64net rendezvous listening on %s:%d%s%s", opts.bind, opts.port,
              f" (public {opts.public_ip})" if opts.public_ip else "",
              ", password required" if password else ", NO password")
+    # Closing the terminal (SIGHUP) or `kill` (SIGTERM) should still run the
+    # cleanup below, which removes the router port mapping.
+    import signal
+    main_task = asyncio.current_task()
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        loop.add_signal_handler(sig, main_task.cancel)
+    mapper = None
+    gateway = default_gateway() if opts.natpmp else None
+    if opts.natpmp:
+        if gateway:
+            mapper = asyncio.create_task(keep_port_mapped(gateway, opts.port))
+        else:
+            log.warning("--natpmp: no default gateway found")
     try:
         while True:
             await asyncio.sleep(10)
             proto.expire()
     finally:
+        if mapper is not None:
+            mapper.cancel()
+            if natpmp_map(gateway, opts.port, 0) is not None:
+                log.info("router port mapping removed")
         transport.close()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
