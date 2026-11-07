@@ -24,11 +24,12 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
 Anything that does not start with "N64R1 " and comes from an endpoint in a
 relaying room is forwarded to the other member of that room.
 
-Usage: rendezvous.py [--port 7780] [--bind 0.0.0.0]
+Usage: rendezvous.py [--port 7780] [--bind 0.0.0.0] [--public-ip A.B.C.D]
 Stdlib only, Python 3.8+.
 """
 import argparse
 import asyncio
+import ipaddress
 import logging
 import secrets
 import time
@@ -46,6 +47,14 @@ log = logging.getLogger("n64net")
 
 def fmt_addr(addr):
     return f"{addr[0]}:{addr[1]}"
+
+
+def is_private(addr):
+    try:
+        ip = ipaddress.ip_address(addr[0])
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
 def valid_code(code):
@@ -73,7 +82,11 @@ class Room:
 
 
 class Rendezvous(asyncio.DatagramProtocol):
-    def __init__(self):
+    def __init__(self, public_ip=None):
+        # Set when the server runs inside a home network: players on that
+        # network are seen at private addresses, so outside players are told
+        # <public_ip>:<same port> instead (most routers keep the port).
+        self.public_ip = public_ip
         self.rooms = {}       # code -> Room
         self.by_addr = {}     # endpoint -> Room
         self.transport = None
@@ -98,9 +111,15 @@ class Rendezvous(asyncio.DatagramProtocol):
             if a is not None and self.by_addr.get(a) is room:
                 del self.by_addr[a]
 
+    def visible_addr(self, member, viewer):
+        """`member`'s address as `viewer` should dial it."""
+        if self.public_ip and is_private(member) and not is_private(viewer):
+            return f"{self.public_ip}:{member[1]}"
+        return fmt_addr(member)
+
     def send_peers(self, room):
-        self.send(room.host, f"PEER {room.code} {fmt_addr(room.guest)} {room.guest_lan} guest")
-        self.send(room.guest, f"PEER {room.code} {fmt_addr(room.host)} {room.host_lan} host")
+        self.send(room.host, f"PEER {room.code} {self.visible_addr(room.guest, room.host)} {room.guest_lan} guest")
+        self.send(room.guest, f"PEER {room.code} {self.visible_addr(room.host, room.guest)} {room.host_lan} host")
 
     def datagram_received(self, data, addr):
         if len(data) > MAX_PACKET:
@@ -217,14 +236,16 @@ async def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7780)
+    ap.add_argument("--public-ip", help="this network's public IP, when hosting behind a home router")
     ap.add_argument("-v", "--verbose", action="store_true")
     opts = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if opts.verbose else logging.INFO,
                         format="%(asctime)s %(message)s")
     loop = asyncio.get_running_loop()
     transport, proto = await loop.create_datagram_endpoint(
-        Rendezvous, local_addr=(opts.bind, opts.port))
-    log.info("n64net rendezvous listening on %s:%d", opts.bind, opts.port)
+        lambda: Rendezvous(opts.public_ip), local_addr=(opts.bind, opts.port))
+    log.info("n64net rendezvous listening on %s:%d%s", opts.bind, opts.port,
+             f" (public {opts.public_ip})" if opts.public_ip else "")
     try:
         while True:
             await asyncio.sleep(10)
