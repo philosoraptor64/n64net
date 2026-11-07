@@ -17,7 +17,12 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
     ROOM <code>                          room held for this host
     PEER <code> <public_ip:port> <lan_ip:port> <host|guest>
     RELAYOK <code>
-    ERR <reason>                         nosuchroom | full | taken | game | badcode | busy
+    ERR <reason>                         nosuchroom | full | taken | game | badcode | busy | auth
+    ERR version <host_build>             same game, different build (see below)
+
+<game> may end in "+<build>": players of the same game with different builds
+cannot stay in sync, so JOIN is refused with "ERR version" (naming the host's
+build) instead of the generic "ERR game".
   client <-> client (not seen by the server unless relayed)
     PUNCH <code> <role> / PUNCHACK <code> <role>
 
@@ -249,7 +254,11 @@ class Rendezvous(asyncio.DatagramProtocol):
             self.send(addr, "ERR nosuchroom")
             return
         if room.game != game:
-            self.send(addr, "ERR game")
+            host_game, _, host_build = room.game.partition("+")
+            if host_game == game.partition("+")[0]:
+                self.send(addr, f"ERR version {host_build or 'unknown'}")
+            else:
+                self.send(addr, "ERR game")
             return
         if room.guest is not None and room.guest != addr:
             if room.guest[0] == addr[0] and not room.relay:
