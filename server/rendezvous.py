@@ -24,11 +24,21 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
 Anything that does not start with "N64R1 " and comes from an endpoint in a
 relaying room is forwarded to the other member of that room.
 
+Password (optional, --password-file): HOST/JOIN/RELAY/BYE then carry two more
+fields, `<unix_time> <mac>`, where mac is the first 32 hex digits of
+HMAC-SHA256(password, "<CMD> <fields...> <unix_time>"). The password never
+crosses the network; the time limits replay to a few minutes. A server with a
+password answers bad or missing signatures with "ERR auth" and ignores an
+address after repeated failures.
+
 Usage: rendezvous.py [--port 7780] [--bind 0.0.0.0] [--public-ip A.B.C.D]
+                     [--password-file PATH]
 Stdlib only, Python 3.8+.
 """
 import argparse
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import logging
 import secrets
@@ -41,6 +51,10 @@ ROOM_IDLE_SECS = 600        # forget rooms idle this long
 RELAY_IDLE_SECS = 120       # forget a relaying room with no traffic this long
 MAX_ROOMS = 5000
 MAX_PACKET = 1500
+AUTH_FIELDS = {"HOST": 3, "JOIN": 3, "RELAY": 1, "BYE": 1}  # fields before <time> <mac>
+AUTH_WINDOW_SECS = 300      # allowed clock difference
+AUTH_MAX_FAILURES = 10      # per address within AUTH_BAN_SECS ...
+AUTH_BAN_SECS = 600         # ... then that address is ignored this long
 
 log = logging.getLogger("n64net")
 
@@ -82,11 +96,13 @@ class Room:
 
 
 class Rendezvous(asyncio.DatagramProtocol):
-    def __init__(self, public_ip=None):
+    def __init__(self, public_ip=None, password=None):
         # Set when the server runs inside a home network: players on that
         # network are seen at private addresses, so outside players are told
         # <public_ip>:<same port> instead (most routers keep the port).
         self.public_ip = public_ip
+        self.password = password.encode() if password else None
+        self.auth_failures = {}  # ip -> [first_failure_time, count]
         self.rooms = {}       # code -> Room
         self.by_addr = {}     # endpoint -> Room
         self.transport = None
@@ -140,12 +156,50 @@ class Rendezvous(asyncio.DatagramProtocol):
         if not parts:
             return
         cmd, args = parts[0], parts[1:]
+        if cmd in AUTH_FIELDS:
+            args = self.check_auth(addr, cmd, args)
+            if args is None:
+                return
         handler = getattr(self, "cmd_" + cmd, None)
         if handler is not None:
             try:
                 handler(addr, args)
             except (IndexError, ValueError):
                 self.send(addr, "ERR bad")
+
+    def check_auth(self, addr, cmd, args):
+        """Returns the fields without the signature, or None if refused."""
+        n = AUTH_FIELDS[cmd]
+        if self.password is None:
+            return args[:n] if len(args) >= n + 2 else args
+        now = time.time()
+        ip = addr[0]
+        fail = self.auth_failures.get(ip)
+        if fail is not None and now - fail[0] > AUTH_BAN_SECS:
+            del self.auth_failures[ip]
+            fail = None
+        if fail is not None and fail[1] >= AUTH_MAX_FAILURES:
+            return None  # silently ignored while banned
+        ok = False
+        if len(args) == n + 2:
+            try:
+                stamp = int(args[n])
+            except ValueError:
+                stamp = None
+            if stamp is not None and abs(now - stamp) <= AUTH_WINDOW_SECS:
+                text = " ".join([cmd] + args[:n + 1]).encode()
+                want = hmac.new(self.password, text, hashlib.sha256).hexdigest()[:32]
+                ok = hmac.compare_digest(want, args[n + 1].lower())
+        if ok:
+            return args[:n]
+        if fail is None:
+            self.auth_failures[ip] = [now, 1]
+        else:
+            fail[1] += 1
+            if fail[1] == AUTH_MAX_FAILURES:
+                log.warning("ignoring %s for %ds after %d bad passwords", ip, AUTH_BAN_SECS, fail[1])
+        self.send(addr, "ERR auth")
+        return None
 
     def cmd_HOST(self, addr, args):
         game, code, lan = args[0], args[1].upper(), args[2]
@@ -237,15 +291,23 @@ async def main():
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7780)
     ap.add_argument("--public-ip", help="this network's public IP, when hosting behind a home router")
+    ap.add_argument("--password-file", help="file whose first line is the server password")
     ap.add_argument("-v", "--verbose", action="store_true")
     opts = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if opts.verbose else logging.INFO,
                         format="%(asctime)s %(message)s")
+    password = None
+    if opts.password_file:
+        with open(opts.password_file) as f:
+            password = f.readline().strip()
+        if not password:
+            ap.error("password file is empty")
     loop = asyncio.get_running_loop()
     transport, proto = await loop.create_datagram_endpoint(
-        lambda: Rendezvous(opts.public_ip), local_addr=(opts.bind, opts.port))
-    log.info("n64net rendezvous listening on %s:%d%s", opts.bind, opts.port,
-             f" (public {opts.public_ip})" if opts.public_ip else "")
+        lambda: Rendezvous(opts.public_ip, password), local_addr=(opts.bind, opts.port))
+    log.info("n64net rendezvous listening on %s:%d%s%s", opts.bind, opts.port,
+             f" (public {opts.public_ip})" if opts.public_ip else "",
+             ", password required" if password else ", NO password")
     try:
         while True:
             await asyncio.sleep(10)
