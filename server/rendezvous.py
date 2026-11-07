@@ -229,9 +229,11 @@ class Rendezvous(asyncio.DatagramProtocol):
             return
         old = self.rooms.get(code)
         if old is not None:
-            # A host that restarted (new port) may reclaim its own code while
-            # nobody has joined yet; otherwise the code is taken.
-            if old.guest is None and old.host[0] == addr[0]:
+            # A host that restarted (new port, same address) reclaims its own
+            # code, even mid-session: a phone that iOS stopped in the
+            # background comes back as a new process. Its guest re-pairs on
+            # its next JOIN. A different address cannot take the code.
+            if old.host[0] == addr[0]:
                 self.drop_room(old, "reclaimed")
             else:
                 self.send(addr, "ERR taken")
@@ -261,9 +263,11 @@ class Rendezvous(asyncio.DatagramProtocol):
                 self.send(addr, "ERR game")
             return
         if room.guest is not None and room.guest != addr:
-            if room.guest[0] == addr[0] and not room.relay:
-                # Same guest restarted on a new port before play began.
+            if room.guest[0] == addr[0]:
+                # The same guest restarted (new port): replace the old one and
+                # start over (the relay re-arms if they still need it).
                 self.by_addr.pop(room.guest, None)
+                room.relay = False
             else:
                 self.send(addr, "ERR full")
                 return
