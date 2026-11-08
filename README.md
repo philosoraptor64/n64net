@@ -63,5 +63,21 @@ first existing of `SDL2::SDL2-static`, `SDL2::SDL2`, `SDL2-static`, `SDL2`).
 - iOS: needs `NSMicrophoneUsageDescription` in Info.plist. For echo cancellation, set
   `AVAudioSessionModeVoiceChat` after the microphone opens.
 
+### Input exchange (lockstep or rollback)
+1. After connecting, `n64net_input_create(&config)`: `num_players`, `local_player`, `remote_mask` (players driven
+   by other machines; others read as neutral, e.g. CPUs), `session_id` (equal on both sides), `start_tick`,
+   `input_delay`, `rollback_window` (0 = lockstep), `ticks_per_second`, and `send` (writes to your socket/peer).
+2. Pass every received datagram to `n64net_input_handle_packet` (returns 0 for packets that aren't its own).
+3. Each tick: `n64net_input_set_local(net, tick, pad)` (never during a resimulation), wait while
+   `!n64net_input_ready(net, tick)` (receive packets, `n64net_input_resend`), then read every player with
+   `n64net_input_get(net, p, tick, &pad)`.
+4. Rollback: at the start of each simulated frame, either `n64net_rollback_frame(net, tick, &callbacks)` (your
+   `save(slot)`, `load(slot)`, `advance()`), or your own snapshot ring with `n64net_take_rollback`. Once per
+   displayed frame, `if (n64net_timesync_should_skip(net))` skip the game step.
+5. Desync detection: keep a state hash per tick (rewritten by resimulations) and `n64net_sync_record` it once the
+   tick is confirmed (`tick <= n64net_input_confirmed_tick(net) + 1`); check `n64net_sync_desynced`.
+6. App switching (iOS): `n64net_input_set_away(net, 1/0)`; on the other side `n64net_input_peer_away` and
+   `n64net_input_peer_silence_usecs` tell you whether to keep waiting.
+
 ## License
 MIT (see `LICENSE`). Opus is BSD-licensed and fetched at build time.
