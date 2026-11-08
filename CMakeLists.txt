@@ -13,6 +13,8 @@ project(n64net LANGUAGES C CXX)
 option(N64NET_VOICE "Build n64net voice chat (SDL2 microphone + Opus)" ON)
 
 add_library(n64net STATIC
+    client/src/n64net_input.cpp
+    client/include/n64net_input.h
     client/src/n64net_rendezvous.cpp
     client/src/n64net_hmac.h
     client/include/n64net_rendezvous.h)
@@ -54,3 +56,10 @@ if (N64NET_VOICE)
 endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/N64NetBuildId.cmake)
+
+option(N64NET_BUILD_TESTS "Build n64net's tests" OFF)
+if (N64NET_BUILD_TESTS)
+    add_executable(n64net_input_test tests/input_test.cpp client/src/n64net_input.cpp)
+    target_include_directories(n64net_input_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/client/include)
+    target_compile_features(n64net_input_test PRIVATE cxx_std_17)
+endif()

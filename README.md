@@ -11,9 +11,11 @@ each game keeps a small adapter. Work in progress.
 | Rendezvous client | `client/include/n64net_rendezvous.h` | Finds the other player through a room code, on the game's own UDP socket. |
 | Voice chat | `client/include/n64net_voice.h` | Opus speech over the game's socket (direct or relayed); mixed into the game's audio output. |
 | Build fingerprint | `cmake/N64NetBuildId.cmake` | Hashes the game's simulation code into a build id, so the server refuses to pair builds that would desync. |
+| Input exchange | `client/include/n64net_input.h` | Input ledger with input delay, prediction and the rollback trigger (or lockstep), time sync, sync checks (desync detection), away/back notices, run-time delay changes, and an optional rollback driver (save/load/advance callbacks). The header documents the per-tick calls. |
 
-Planned next: the input ledger, prediction and rollback trigger, frame-advantage time sync,
-sync-check exchange and away/back notices, extracted from BattleShip's netcode.
+Tests: `cmake -S . -B build -DN64NET_BUILD_TESTS=ON -DN64NET_VOICE=OFF && cmake --build build && build/n64net_input_test`
+(two peers over a simulated network: lockstep and rollback, loss/latency/jitter, delay changes, a late start, and
+a deliberate desync).
 
 ## Run the server
 ```
