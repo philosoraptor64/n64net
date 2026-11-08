@@ -68,8 +68,10 @@ void n64net_input_destroy(n64net_input *net);
 
 /* The local controller sampled at `tick` (call once per tick, before
  * n64net_input_get for that tick; never during a resimulation). It is applied
- * at tick + input_delay; the ticks before the first sample + delay read as
- * neutral. Sends an input packet. */
+ * at tick + input_delay. The first input_delay ticks after start_tick are
+ * neutral (sent from the start, so lockstep can't deadlock on them); with a
+ * delay of 0, lockstep needs each side to sample before waiting. Sends an
+ * input packet. */
 void n64net_input_set_local(n64net_input *net, uint32_t tick, n64net_pad pad);
 
 /* 1 if `tick` may be simulated now: every remote player's inputs are confirmed
@@ -92,6 +94,13 @@ void n64net_input_resend(n64net_input *net);
 /* If a remote input arrived for an already-simulated tick and differs from
  * the prediction used, returns 1 and the earliest such tick (once). */
 int n64net_take_rollback(n64net_input *net, uint32_t *tick);
+
+/* Like n64net_take_rollback, without consuming it. */
+int n64net_peek_rollback(n64net_input *net, uint32_t *tick);
+
+/* Switch between lockstep (0) and rollback at a tick boundary, e.g. lockstep
+ * menus and rollback battles in one session. */
+void n64net_input_set_window(n64net_input *net, uint32_t rollback_window);
 
 /* Highest tick whose inputs are all confirmed (UINT32_MAX before any). */
 uint32_t n64net_input_confirmed_tick(n64net_input *net);

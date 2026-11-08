@@ -121,8 +121,9 @@ struct n64net_input {
 
     // Sync checks.
     SyncEntry local_sync[kSyncRing];
-    SyncEntry remote_sync[kSyncRing];
+    SyncEntry remote_sync[kSyncRing];  // in arrival order
     uint32_t local_sync_count = 0;
+    uint32_t remote_sync_count = 0;
     bool desynced = false;
     uint32_t desync_tick = 0;
     uint8_t desync_kind = 0;
@@ -185,6 +186,12 @@ struct n64net_input {
     void HandleInput(Reader &r, uint8_t player, uint8_t count);
     void HandleSync(Reader &r, uint8_t count);
     void CompareSync(const SyncEntry &a, const SyncEntry &b);
+    static const SyncEntry *FindSync(const SyncEntry *ring, uint32_t count, uint32_t tick, uint8_t kind) {
+        for (uint32_t j = 0; j < std::min(count, kSyncRing); j++) {
+            if (ring[j].tick == tick && ring[j].kind == kind) return &ring[j];
+        }
+        return nullptr;
+    }
 };
 
 void n64net_input::SendInputs() {
@@ -337,15 +344,10 @@ void n64net_input::HandleSync(Reader &r, uint8_t count) {
     stats.packets_received++;
     last_recv_usecs = Now();
     for (uint32_t i = 0; i < count; i++) {
-        SyncEntry &slot = remote_sync[got[i].tick % kSyncRing];
-        if (slot.tick == got[i].tick && slot.kind == got[i].kind) continue;  // seen
-        slot = got[i];
-        for (uint32_t j = 0; j < std::min(local_sync_count, kSyncRing); j++) {
-            const SyncEntry &e = local_sync[j];
-            if (e.tick == slot.tick && e.kind == slot.kind) {
-                CompareSync(e, slot);
-                break;
-            }
+        if (FindSync(remote_sync, remote_sync_count, got[i].tick, got[i].kind)) continue;  // seen (repeats)
+        remote_sync[remote_sync_count++ % kSyncRing] = got[i];
+        if (const SyncEntry *mine = FindSync(local_sync, local_sync_count, got[i].tick, got[i].kind)) {
+            CompareSync(*mine, got[i]);
         }
     }
 }
@@ -371,6 +373,16 @@ n64net_input *n64net_input_create(const n64net_input_config *config) {
         net->next_needed[p] = config->start_tick;
     }
     net->peer_ack = config->start_tick;
+    if (net->delay > 0) {
+        // The first `delay` ticks are neutral on every machine, and known now:
+        // a side waiting for them must not depend on the other's first sample
+        // (both would wait for each other in lockstep).
+        for (uint32_t t = config->start_tick; t < config->start_tick + net->delay; t++) {
+            net->StoreLocal(t, n64net_pad{0, 0, 0});
+        }
+        net->local_started = true;
+        net->local_last = config->start_tick + net->delay - 1;
+    }
     return net;
 }
 
@@ -479,6 +491,16 @@ void n64net_input_resend(n64net_input *net) {
     }
 }
 
+int n64net_peek_rollback(n64net_input *net, uint32_t *tick) {
+    if (!net->rollback_pending) return 0;
+    *tick = net->rollback_tick;
+    return 1;
+}
+
+void n64net_input_set_window(n64net_input *net, uint32_t rollback_window) {
+    net->cfg.rollback_window = rollback_window;
+}
+
 int n64net_take_rollback(n64net_input *net, uint32_t *tick) {
     if (!net->rollback_pending) return 0;
     *tick = net->rollback_tick;
@@ -525,8 +547,9 @@ void n64net_sync_record(n64net_input *net, uint32_t tick, uint8_t kind, uint32_t
     e.hash = hash;
     net->local_sync[net->local_sync_count % kSyncRing] = e;
     net->local_sync_count++;
-    const SyncEntry &theirs = net->remote_sync[tick % kSyncRing];
-    if (theirs.tick == tick && theirs.kind == kind) net->CompareSync(e, theirs);
+    if (const SyncEntry *theirs = n64net_input::FindSync(net->remote_sync, net->remote_sync_count, tick, kind)) {
+        net->CompareSync(e, *theirs);
+    }
     net->SendSync();
 }
 
