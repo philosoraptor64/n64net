@@ -174,6 +174,9 @@ typedef struct n64net_rollback_callbacks {
     uint32_t slot_count;
 } n64net_rollback_callbacks;
 int n64net_rollback_frame(n64net_input *net, uint32_t tick, const n64net_rollback_callbacks *callbacks);
+/* Inside a save/load/advance callback: the tick it is about (save/load: the
+ * state before that tick; advance: the tick being run). */
+uint32_t n64net_rollback_callback_tick(n64net_input *net);
 /* 1 while n64net_rollback_frame is resimulating (inputs come from the ledger;
  * skip drawing, sound and n64net_input_set_local). */
 int n64net_rollback_resimulating(n64net_input *net);

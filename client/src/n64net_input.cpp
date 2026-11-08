@@ -107,6 +107,7 @@ struct n64net_input {
     bool rollback_pending = false;
     uint32_t rollback_tick = 0;
     int resimulating = 0;
+    uint32_t driver_tick = 0;  // the tick n64net_rollback_frame's current callback is about
     std::vector<uint32_t> slot_tick;
 
     // Timing.
@@ -658,9 +659,11 @@ int n64net_rollback_frame(n64net_input *net, uint32_t tick, const n64net_rollbac
             net->Log("n64net input: cannot roll back to tick %u from %u: state too old\n", from, tick);
             depth = -1;
         } else {
+            net->driver_tick = from;
             cb->load(cb->user, from % n);
             net->resimulating = 1;
             for (uint32_t t = from; t < tick; t++) {
+                net->driver_tick = t;
                 if (t != from) {
                     cb->save(cb->user, t % n);
                     net->slot_tick[t % n] = t;
@@ -672,10 +675,13 @@ int n64net_rollback_frame(n64net_input *net, uint32_t tick, const n64net_rollbac
             net->stats.rollbacks++;
         }
     }
+    net->driver_tick = tick;
     cb->save(cb->user, tick % n);
     net->slot_tick[tick % n] = tick;
     return depth;
 }
+
+uint32_t n64net_rollback_callback_tick(n64net_input *net) { return net->driver_tick; }
 
 int n64net_rollback_resimulating(n64net_input *net) { return net->resimulating; }
 

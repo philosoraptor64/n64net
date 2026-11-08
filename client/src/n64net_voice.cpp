@@ -54,7 +54,12 @@ struct Packet {
 };
 
 std::mutex sLock;  // guards sSlots/sHighest/sHaveAny and sOutgoing
-bool sRunning = false;
+// Guards the mixer (decoder, jitter and resampler state): n64net_voice_mix
+// may run on the game's audio thread (or two threads, e.g. a stall
+// keep-alive), while start/stop run on the game thread. Lock order: sMixLock,
+// then sLock.
+std::mutex sMixLock;
+std::atomic<bool> sRunning{false};
 n64net_voice_config sConfig = {};
 SDL_AudioDeviceID sCaptureDev = 0;
 OpusEncoder *sEncoder = nullptr;
@@ -281,9 +286,10 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
     }
     int err = 0;
     sEncoder = opus_encoder_create(kRate, 1, OPUS_APPLICATION_VOIP, &err);
-    sDecoder = opus_decoder_create(kRate, 1, &err);
-    if (sEncoder == nullptr || sDecoder == nullptr) {
+    OpusDecoder *decoder = opus_decoder_create(kRate, 1, &err);
+    if (sEncoder == nullptr || decoder == nullptr) {
         Log("n64net voice: Opus setup failed\n");
+        if (decoder != nullptr) opus_decoder_destroy(decoder);
         n64net_voice_stop();
         return;
     }
@@ -301,10 +307,14 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
         sHaveAny = false;
         sOutgoing.clear();
     }
-    sPlaying = false;
-    sPcmPos = kFrame;
-    sResPrev = sResCur = 0.0f;
-    sResPhase = 0.0;
+    {
+        std::lock_guard<std::mutex> mix(sMixLock);
+        sDecoder = decoder;
+        sPlaying = false;
+        sPcmPos = kFrame;
+        sResPrev = sResCur = 0.0f;
+        sResPhase = 0.0;
+    }
     sCapFill = 0;
     sSendSeq = 0;
     sToneFrames = 0;
@@ -333,21 +343,26 @@ extern "C" void n64net_voice_stop(void) {
         opus_encoder_destroy(sEncoder);
         sEncoder = nullptr;
     }
-    if (sDecoder != nullptr) {
-        opus_decoder_destroy(sDecoder);
-        sDecoder = nullptr;
+    bool was_running;
+    {
+        std::lock_guard<std::mutex> mix(sMixLock);  // waits for a mix in progress (audio thread)
+        was_running = sRunning.exchange(false);
+        if (sDecoder != nullptr) {
+            opus_decoder_destroy(sDecoder);
+            sDecoder = nullptr;
+        }
     }
-    if (sRunning) {
+    if (was_running) {
         if (sConfig.log != nullptr) {
             sConfig.log("n64net voice: off (sent %u, received %u, lost %u)\n", sSent.load(), sRecv.load(),
                         sLost.load());
         }
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
     }
-    sRunning = false;
 }
 
 extern "C" void n64net_voice_mix(int16_t *stereo, int frames, int rate) {
+    std::lock_guard<std::mutex> mix(sMixLock);
     if (!sRunning || sDecoder == nullptr || stereo == nullptr || rate <= 0) {
         return;
     }

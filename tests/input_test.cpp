@@ -88,7 +88,11 @@ void Deliver() {
     }
 }
 
-void Save(void *u, uint32_t slot) { Peer *p = (Peer *)u; p->slots[slot] = p->game; }
+void Save(void *u, uint32_t slot) {
+    Peer *p = (Peer *)u;
+    if (n64net_rollback_callback_tick(p->net) != p->game.tick) printf("FAIL callback tick %u vs game %u\n", n64net_rollback_callback_tick(p->net), p->game.tick);
+    p->slots[slot] = p->game;
+}
 void Load(void *u, uint32_t slot) { Peer *p = (Peer *)u; p->game = p->slots[slot]; }
 void Advance(void *u) {
     Peer *p = (Peer *)u;

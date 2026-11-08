@@ -36,7 +36,9 @@ int n64net_voice_is_running(void);
 
 /* The game's audio output calls this for every block it plays: adds the
  * other player's voice to `stereo` (interleaved s16, `frames` frames at
- * `rate` Hz). The voice is paced by the game's own audio clock. */
+ * `rate` Hz). The voice is paced by the game's own audio clock. Safe to call
+ * from any thread (e.g. an audio thread, or a stall keep-alive timer), also
+ * while the game thread receives packets or calls start/stop. */
 void n64net_voice_mix(int16_t *stereo, int frames, int rate);
 
 /* Call often (every game tick, and while waiting): sends captured frames. */
