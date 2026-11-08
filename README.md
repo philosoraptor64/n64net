@@ -32,8 +32,7 @@ n64net_add_build_id(<game>
     ENTRIES "${CMAKE_SOURCE_DIR}::src" "${CMAKE_SOURCE_DIR}/torch::src")   # <checkout>::<path>, simulation code only
 ```
 Options: `N64NET_VOICE` (default ON; builds Opus 1.5.2 via FetchContent), `N64NET_SDL2_TARGET` (default: the
-first existing of `SDL2::SDL2-static`, `SDL2::SDL2`, `SDL2-static`, `SDL2`). `n64net_voice.cpp` includes
-`<SDL2/SDL.h>`.
+first existing of `SDL2::SDL2-static`, `SDL2::SDL2`, `SDL2-static`, `SDL2`).
 
 ### Connecting with a room code
 1. Open one non-blocking IPv4 UDP socket and bind it (port 0 is fine). Use this same socket for gameplay:

@@ -20,8 +20,6 @@
 # since a commit changes the id without touching any file, and rewritten only
 # when the value changes. Outside a git checkout the id is "nogit".
 
-set(N64NET_BUILD_ID_SCRIPT "${CMAKE_CURRENT_LIST_FILE}")
-
 function(n64net_add_build_id target)
     cmake_parse_arguments(ARG "" "HEADER;MACRO" "ENTRIES" ${ARGN})
     if (NOT ARG_HEADER OR NOT ARG_MACRO OR NOT ARG_ENTRIES)
@@ -30,9 +28,11 @@ function(n64net_add_build_id target)
     set(list_file "${CMAKE_CURRENT_BINARY_DIR}/${target}_n64net_build_id_entries.txt")
     string(REPLACE ";" "\n" entries "${ARG_ENTRIES}")
     file(WRITE "${list_file}" "${entries}\n")
+    set(cmd ${CMAKE_COMMAND} -DN64NET_ENTRIES_FILE=${list_file} -DN64NET_OUT=${ARG_HEADER}
+            -DN64NET_MACRO=${ARG_MACRO} -P ${CMAKE_CURRENT_FUNCTION_LIST_FILE})
+    execute_process(COMMAND ${cmd})  # so the header exists before the first build
     add_custom_target(${target}_n64net_build_id
-        COMMAND ${CMAKE_COMMAND} -DN64NET_ENTRIES_FILE=${list_file} -DN64NET_OUT=${ARG_HEADER}
-                -DN64NET_MACRO=${ARG_MACRO} -P ${N64NET_BUILD_ID_SCRIPT}
+        COMMAND ${cmd}
         BYPRODUCTS ${ARG_HEADER}
         COMMENT "n64net: netplay build id"
         VERBATIM)

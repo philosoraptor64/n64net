@@ -12,7 +12,11 @@
  * and resamples 48 kHz to the game's rate (linear). */
 #include "n64net_voice.h"
 
+#if __has_include(<SDL2/SDL.h>)
 #include <SDL2/SDL.h>
+#else
+#include <SDL.h>
+#endif
 #include <opus.h>
 
 #include <atomic>

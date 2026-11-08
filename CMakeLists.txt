@@ -7,10 +7,7 @@
 #   N64NET_VOICE (ON)        voice chat (needs SDL2 for the microphone; builds Opus)
 #   N64NET_SDL2_TARGET       the SDL2 target to link (default: the first of
 #                            SDL2::SDL2-static, SDL2::SDL2, SDL2-static, SDL2 that exists)
-# n64net_voice.cpp includes <SDL2/SDL.h>; if your SDL2 target's include
-# directories don't provide that layout, add the right directory with
-# target_include_directories(n64net PRIVATE ...).
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.17)
 project(n64net LANGUAGES C CXX)
 
 option(N64NET_VOICE "Build n64net voice chat (SDL2 microphone + Opus)" ON)
