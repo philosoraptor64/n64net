@@ -32,7 +32,8 @@ struct Packet {
 std::deque<Packet> gWire;
 int gLossPercent = 0, gLatencyUsecs = 0, gJitterUsecs = 0;
 uint32_t gLateStart = 0;      // peer 1 starts this many frames late
-uint32_t gCorruptTick = 0;    // peer 1's state is nudged at this tick (desync test)
+uint32_t gCorruptTick = 0;
+uint32_t gAutoMax = 0;        // auto delay [1, gAutoMax] when non-zero    // peer 1's state is nudged at this tick (desync test)
 
 struct Game {  // the "simulation": two points moved by the pads, plus an RNG
     int32_t x[2], y[2];
@@ -142,6 +143,7 @@ int Run(const char *name, uint32_t window, uint32_t delay, int loss, int latency
         c.log = Log;
         c.now_usecs = Now;
         p.net = n64net_input_create(&c);
+        if (gAutoMax) n64net_input_set_auto_delay(p.net, 1, gAutoMax);
     }
     uint32_t stalls[2] = {0, 0};
     for (uint32_t f = 0; f < frames; f++) {
@@ -215,6 +217,7 @@ int Run(const char *name, uint32_t window, uint32_t delay, int loss, int latency
         printf("%s: FAIL only %u sync checks matched\n", name, matched);
         rc = 1;
     }
+    if (gAutoMax) printf("%s: final delays %u/%u\n", name, n64net_input_get_delay(gPeers[0].net), n64net_input_get_delay(gPeers[1].net));
     printf("%s: %s ticks %u/%u, sync matched %u, stalls %u/%u, predictions %u, mispredictions %u, rollbacks %u/%u, "
            "skips %u/%u, rtt avg %u us\n",
            name, rc ? "FAIL" : "ok", gPeers[0].game.tick, gPeers[1].game.tick, matched, stalls[0], stalls[1],
@@ -234,6 +237,11 @@ int main() {
     rc |= Run("rollback 50ms+30 jitter 10% loss", 8, 2, 10, 50, 30, 3000, false);
     rc |= Run("rollback delay change", 8, 2, 5, 40, 20, 3000, true);
     rc |= Run("lockstep delay change", 0, 2, 5, 20, 10, 3000, true);
+    rc |= Run("lockstep 50ms+20 jitter, fixed delay 1", 0, 1, 2, 50, 20, 3000, false);
+    gAutoMax = 8;
+    rc |= Run("lockstep 50ms+20 jitter, auto delay", 0, 1, 2, 50, 20, 3000, false);
+    rc |= Run("rollback 50ms+20 jitter, auto delay", 8, 1, 2, 50, 20, 3000, false);
+    gAutoMax = 0;
     gLateStart = 20;
     rc |= Run("rollback, peer 1 starts 20 frames late (time sync)", 8, 2, 0, 20, 5, 3000, false);
     gLateStart = 0;

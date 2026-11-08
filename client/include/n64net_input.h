@@ -110,6 +110,15 @@ uint32_t n64net_input_confirmed_tick(n64net_input *net);
  * shrinking it drops samples that would land on already-scheduled ticks. */
 void n64net_input_set_delay(n64net_input *net, uint32_t input_delay);
 
+/* Automatic input delay: each side wishes for enough delay to cover the
+ * one-way time of the 90th percentile of recent round trips (less one tick),
+ * within [min_delay, max_delay]; both apply the larger of the two wishes, up
+ * at once, down one tick after 8 calm seconds. max_delay 0 turns it off. In
+ * lockstep this trades a little input lag for far fewer stalls; with
+ * rollback, keep max_delay low (rollback hides the rest). */
+void n64net_input_set_auto_delay(n64net_input *net, uint32_t min_delay, uint32_t max_delay);
+uint32_t n64net_input_get_delay(n64net_input *net);
+
 /* --- Time sync -------------------------------------------------------------
  * Each side measures its advantage (its tick minus the newest remote tick it
  * has) and sends it with every input packet. When this side runs ahead of the

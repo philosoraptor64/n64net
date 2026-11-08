@@ -6,7 +6,7 @@
  *           player) | u32 first_tick | count x (u16 buttons, s8 x, s8 y) |
  *           u32 stamp (sender clock, usecs) | u32 echo (newest stamp received
  *           from the destination) | u32 hold (usecs since that stamp arrived) |
- *           s32 advantage | u32 checksum
+ *           s32 advantage | u8 wished delay (auto delay; 0 = none) | u32 checksum
  *   sync:   magic | version | type=1 | player | count | session |
  *           count x (u32 tick, u8 kind, u32 hash) | checksum
  *   away:   magic | version | type=2 (away) or 3 (back) | player | 0 | session | checksum
@@ -23,7 +23,8 @@
 
 namespace {
 
-constexpr uint8_t kVersion = 1;
+constexpr uint8_t kVersion = 2;
+constexpr uint32_t kRttRing = 90;  // round trips kept (auto delay uses their 90th percentile)
 constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3;
 constexpr uint32_t kRing = 1024;           // ticks of history kept per player
 constexpr uint32_t kMaxFramesPerPacket = 16;
@@ -132,8 +133,13 @@ struct n64net_input {
     bool peer_away = false;
 
     n64net_input_stats stats = {};
-    uint32_t rtt_samples[32] = {};
+    uint32_t rtt_samples[kRttRing] = {};
     uint32_t rtt_count = 0;
+
+    // Auto delay (n64net_input_set_auto_delay).
+    uint32_t auto_min = 0, auto_max = 0;  // 0/0 = off
+    uint32_t peer_wish = 0;
+    uint64_t calm_since = 0;              // when the wish last stopped being above the delay
 
     uint64_t Now() const { return cfg.now_usecs ? cfg.now_usecs() : SteadyUsecs(); }
     void Log(const char *fmt, ...) const {
@@ -181,6 +187,23 @@ struct n64net_input {
         return true;
     }
 
+    // The delay this side wants: enough ticks to cover the one-way time of
+    // the 90th percentile of recent round trips, less one tick (each side
+    // polls once per tick), within [auto_min, auto_max]. 0 when off.
+    uint32_t Wish() const {
+        if (auto_max == 0) return 0;
+        const uint32_t n = std::min(rtt_count, kRttRing);
+        if (n < 8) return std::max(auto_min, delay);
+        uint32_t sorted[kRttRing];
+        std::copy(rtt_samples, rtt_samples + n, sorted);
+        std::sort(sorted, sorted + n);
+        const uint32_t p90 = sorted[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1];
+        const uint32_t tick_usecs = 1000000u / cfg.ticks_per_second;
+        uint32_t ticks = (p90 / 2 + tick_usecs - 1) / tick_usecs;
+        ticks = ticks > 0 ? ticks - 1 : 0;
+        return std::min(std::max(ticks, auto_min), auto_max);
+    }
+    void UpdateAutoDelay(uint64_t now);
     void SendInputs();
     void SendSync();
     void HandleInput(Reader &r, uint8_t player, uint8_t count);
@@ -193,6 +216,25 @@ struct n64net_input {
         return nullptr;
     }
 };
+
+void n64net_input::UpdateAutoDelay(uint64_t now) {
+    if (auto_max == 0) return;
+    // Both sides apply the larger wish, so the delay is the same both ways.
+    const uint32_t target = std::min(std::max(Wish(), peer_wish), auto_max);
+    if (target > delay) {
+        delay = target;  // up at once
+        calm_since = now;
+        Log("n64net input: auto delay up to %u\n", delay);
+    } else if (target < delay) {
+        if (now - calm_since >= 8000000) {  // down one step after 8 calm seconds
+            delay--;
+            calm_since = now;
+            Log("n64net input: auto delay down to %u\n", delay);
+        }
+    } else {
+        calm_since = now;
+    }
+}
 
 void n64net_input::SendInputs() {
     uint8_t buf[N64NET_INPUT_MAX_PACKET];
@@ -225,6 +267,7 @@ void n64net_input::SendInputs() {
     w.U32(have_peer_stamp ? peer_stamp : 0);
     w.U32(have_peer_stamp ? (uint32_t)(now - peer_stamp_at) : 0);
     w.U32((uint32_t)LocalAdvantage());
+    w.U8((uint8_t)std::min<uint32_t>(Wish(), 255));
     w.U32(Fnv(buf, (uint32_t)(w.p - buf)));
     Send(buf, (uint32_t)(w.p - buf));
     last_send_usecs = now;
@@ -279,6 +322,7 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count) {
     const uint32_t echo = r.U32();
     const uint32_t hold = r.U32();
     const int32_t advantage = (int32_t)r.U32();
+    const uint8_t wish = r.U8();
     if (!r.ok || count > kMaxFramesPerPacket) {
         stats.packets_dropped++;
         return;
@@ -290,11 +334,12 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count) {
     peer_stamp_at = now;
     have_peer_stamp = true;
     remote_advantage = advantage;
+    peer_wish = wish;
     remote_advantage_valid = true;
     if (echo != 0) {
         const uint32_t rtt = (uint32_t)now - echo - hold;
         if (rtt < 10000000u) {
-            rtt_samples[rtt_count++ % 32] = rtt;
+            rtt_samples[rtt_count++ % kRttRing] = rtt;
             stats.rtt_max_usecs = std::max(stats.rtt_max_usecs, rtt);
         }
     }
@@ -389,6 +434,7 @@ n64net_input *n64net_input_create(const n64net_input_config *config) {
 void n64net_input_destroy(n64net_input *net) { delete net; }
 
 void n64net_input_set_local(n64net_input *net, uint32_t tick, n64net_pad pad) {
+    net->UpdateAutoDelay(net->Now());
     const uint32_t target = tick + net->delay;
     if (!net->local_started) {
         // Ticks before the first sample lands are neutral on every machine.
@@ -523,6 +569,14 @@ void n64net_input_set_delay(n64net_input *net, uint32_t input_delay) {
     }
 }
 
+void n64net_input_set_auto_delay(n64net_input *net, uint32_t min_delay, uint32_t max_delay) {
+    net->auto_min = min_delay;
+    net->auto_max = max_delay;
+    net->calm_since = net->Now();
+}
+
+uint32_t n64net_input_get_delay(n64net_input *net) { return net->delay; }
+
 int n64net_timesync_should_skip(n64net_input *net) {
     if (net->cfg.rollback_window == 0 || !net->remote_advantage_valid) return 0;
     // Twice the ticks we run ahead (our advantage minus the peer's), smoothed
@@ -586,7 +640,7 @@ uint64_t n64net_input_peer_silence_usecs(n64net_input *net) {
 
 void n64net_input_get_stats(n64net_input *net, n64net_input_stats *out) {
     *out = net->stats;
-    const uint32_t n = std::min(net->rtt_count, 32u);
+    const uint32_t n = std::min(net->rtt_count, kRttRing);
     uint64_t sum = 0;
     for (uint32_t i = 0; i < n; i++) sum += net->rtt_samples[i];
     out->rtt_avg_usecs = n ? (uint32_t)(sum / n) : 0;
