@@ -20,6 +20,8 @@
 #include <opus.h>
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -28,8 +30,9 @@
 #include <vector>
 
 #if N64NET_VOICE_IOS
-extern "C" int n64net_voice_ios_enable_voice_processing(char *error, unsigned error_size);  // n64net_voice_ios.mm
+extern "C" int n64net_voice_ios_enable_voice_processing(int processing, char *error, unsigned error_size);  // n64net_voice_ios.mm
 extern "C" void n64net_voice_ios_describe_route(char *out, unsigned out_size);
+extern "C" void n64net_voice_ios_documents_path(const char *name, char *out, unsigned out_size);
 #endif
 
 namespace {
@@ -104,6 +107,13 @@ std::atomic<uint32_t> sMicFrames{0}, sMicLoud{0}, sMicPeak{0};
 uint64_t sMicCheckMs = 0;   // when to check that the microphone delivers audio
 int sMicReopens = 0;
 uint32_t sPumpCalls = 0;
+// Debug: N64NET_VOICE_DUMP=<file> records the first 90 s of microphone audio
+// (before encoding) to a WAV file; relative names go to Documents on iOS.
+constexpr int kDumpFrames = 90 * 50;
+int16_t *sDumpBuf = nullptr;
+std::atomic<int> sDumpCount{0};
+int sDumpWritten = 0;
+char sDumpPath[1024];
 
 int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -130,6 +140,22 @@ float Rms(const int16_t *pcm, int n) {
     return static_cast<float>(std::sqrt(sum / n));
 }
 
+void WriteDump() {
+    const int frames = sDumpCount.load();
+    if (sDumpBuf == nullptr || frames == sDumpWritten) return;
+    FILE *f = std::fopen(sDumpPath, "wb");
+    if (f == nullptr) return;
+    const uint32_t bytes = static_cast<uint32_t>(frames) * kFrame * 2;
+    auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+    std::fwrite("RIFF", 1, 4, f); u32(36 + bytes); std::fwrite("WAVEfmt ", 1, 8, f);
+    u32(16); u16(1); u16(1); u32(kRate); u32(kRate * 2); u16(2); u16(16);
+    std::fwrite("data", 1, 4, f); u32(bytes);
+    std::fwrite(sDumpBuf, 2, static_cast<size_t>(frames) * kFrame, f);
+    std::fclose(f);
+    sDumpWritten = frames;
+}
+
 // One 20 ms frame of local audio -> a queued packet (when transmitting).
 void EncodeFrame(const int16_t *pcm) {
     {
@@ -137,6 +163,11 @@ void EncodeFrame(const int16_t *pcm) {
         sMicFrames++;
         if (level > static_cast<uint32_t>(kSpeakingRms * 1000.0f)) sMicLoud++;
         if (level > sMicPeak.load()) sMicPeak = level;
+        const int d = sDumpCount.load();
+        if (sDumpBuf != nullptr && d < kDumpFrames) {
+            std::memcpy(sDumpBuf + static_cast<size_t>(d) * kFrame, pcm, kFrame * 2);
+            sDumpCount = d + 1;
+        }
     }
     if (!Transmitting() || sEncoder == nullptr) {
         return;
@@ -288,7 +319,9 @@ SDL_AudioDeviceID OpenMicrophone() {
     }
 #if N64NET_VOICE_IOS
     char error[160];
-    if (dev != 0 && !n64net_voice_ios_enable_voice_processing(error, sizeof error)) {
+    const char *proc = getenv("N64NET_VOICE_PROCESSING");  // debug: 0 = no voice processing
+    const int processing = !(proc != nullptr && proc[0] == '0');
+    if (dev != 0 && !n64net_voice_ios_enable_voice_processing(processing, error, sizeof error)) {
         Log("n64net voice: no echo cancellation (voice-chat mode not set: %s)\n", error);
     }
     if (dev != 0) {
@@ -350,6 +383,17 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
     sMicFrames = sMicLoud = sMicPeak = 0;
     sMicReopens = 0;
     sMicCheckMs = NowMs() + 2000;
+    if (const char *dump = getenv("N64NET_VOICE_DUMP"); dump != nullptr && dump[0] != 0 && sDumpBuf == nullptr) {
+#if N64NET_VOICE_IOS
+        if (dump[0] != '/') n64net_voice_ios_documents_path(dump, sDumpPath, sizeof sDumpPath);
+        else
+#endif
+        snprintf(sDumpPath, sizeof sDumpPath, "%s", dump);
+        sDumpBuf = static_cast<int16_t *>(std::calloc(static_cast<size_t>(kDumpFrames) * kFrame, 2));
+        sDumpCount = 0;
+        sDumpWritten = 0;
+        Log("n64net voice: recording the microphone to %s\n", sDumpPath);
+    }
     sPumpCalls = 0;
     sRunning = true;  // before the devices start calling back
 
@@ -464,6 +508,7 @@ extern "C" void n64net_voice_pump(n64net_voice_send_fn send) {
                     sSent.load(), sRecv.load(), sLost.load(), sFec.load(), sLate.load(), sUnderruns.load(),
                     sTrims.load(), sSkips.load(), sDropped.load(), sAudibleFrames.load(), sMicFrames.load(),
                     sMicLoud.load(), sMicPeak.load() / 1000.0);
+        WriteDump();
     }
 }
 

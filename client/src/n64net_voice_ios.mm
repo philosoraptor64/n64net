@@ -5,7 +5,7 @@
 #import <AVFoundation/AVFoundation.h>
 #include <stdio.h>
 
-extern "C" int n64net_voice_ios_enable_voice_processing(char *error, unsigned error_size) {
+extern "C" int n64net_voice_ios_enable_voice_processing(int processing, char *error, unsigned error_size) {
     AVAudioSession *s = [AVAudioSession sharedInstance];
     NSError *err = nil;
     // Voice-chat mode on its own routes like a phone call held to the face:
@@ -17,7 +17,8 @@ extern "C" int n64net_voice_ios_enable_voice_processing(char *error, unsigned er
     if (![category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
         category = AVAudioSessionCategoryPlayAndRecord;
     }
-    if (![s setCategory:category mode:AVAudioSessionModeVoiceChat options:options error:&err]) {
+    NSString *mode = processing ? AVAudioSessionModeVoiceChat : AVAudioSessionModeDefault;
+    if (![s setCategory:category mode:mode options:options error:&err]) {
         snprintf(error, error_size, "%s", err ? err.localizedDescription.UTF8String : "unknown error");
         return 0;
     }
@@ -52,4 +53,9 @@ extern "C" void n64net_voice_ios_describe_route(char *out, unsigned out_size) {
     }
     [line appendFormat:@"; input gain %.2f", s.inputGain];
     snprintf(out, out_size, "%s", line.UTF8String);
+}
+
+extern "C" void n64net_voice_ios_documents_path(const char *name, char *out, unsigned out_size) {
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    snprintf(out, out_size, "%s/%s", docs.UTF8String, name);
 }
