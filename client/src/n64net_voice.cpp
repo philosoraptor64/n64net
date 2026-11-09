@@ -33,6 +33,14 @@
 extern "C" int n64net_voice_ios_enable_voice_processing(int processing, char *error, unsigned error_size);  // n64net_voice_ios.mm
 extern "C" void n64net_voice_ios_describe_route(char *out, unsigned out_size);
 extern "C" void n64net_voice_ios_documents_path(const char *name, char *out, unsigned out_size);
+// n64net_voice_vpio_ios.mm
+extern "C" int n64net_vpio_start(void (*capture)(const int16_t *mono, int frames), char *error, unsigned error_size);
+extern "C" void n64net_vpio_stop(void);
+extern "C" int n64net_vpio_active(void);
+extern "C" void n64net_vpio_write(const int16_t *stereo, int frames, int rate);
+extern "C" int n64net_vpio_buffered(int rate);
+extern "C" int n64net_vpio_check(char *note, unsigned note_size);
+extern "C" void n64net_vpio_stats(char *out, unsigned out_size);
 #endif
 
 namespace {
@@ -157,8 +165,8 @@ void WriteDump() {
 }
 
 // One 20 ms frame of local audio -> a queued packet (when transmitting).
-void EncodeFrame(const int16_t *pcm) {
-    {
+void EncodeFrame(const int16_t *pcm, bool from_mic = true) {
+    if (from_mic) {
         const uint32_t level = static_cast<uint32_t>(Rms(pcm, kFrame) * 1000.0f);
         sMicFrames++;
         if (level > static_cast<uint32_t>(kSpeakingRms * 1000.0f)) sMicLoud++;
@@ -168,6 +176,7 @@ void EncodeFrame(const int16_t *pcm) {
             std::memcpy(sDumpBuf + static_cast<size_t>(d) * kFrame, pcm, kFrame * 2);
             sDumpCount = d + 1;
         }
+        if (sConfig.test_tone) return;  // tests: the mic is only measured, the tone is sent
     }
     if (!Transmitting() || sEncoder == nullptr) {
         return;
@@ -197,9 +206,7 @@ void EncodeFrame(const int16_t *pcm) {
     sOutgoing.push_back(p);
 }
 
-void SDLCALL CaptureCallback(void *, Uint8 *stream, int len) {
-    const int16_t *in = reinterpret_cast<const int16_t *>(stream);
-    int count = len / 2;
+void FeedCapture(const int16_t *in, int count) {
     while (count > 0) {
         int take = std::min(count, kFrame - sCapFill);
         std::memcpy(sCapBuf + sCapFill, in, take * 2);
@@ -211,6 +218,20 @@ void SDLCALL CaptureCallback(void *, Uint8 *stream, int len) {
             sCapFill = 0;
         }
     }
+}
+
+void SDLCALL CaptureCallback(void *, Uint8 *stream, int len) {
+    FeedCapture(reinterpret_cast<const int16_t *>(stream), len / 2);
+}
+
+#if N64NET_VOICE_IOS
+bool sUsingUnit = false;  // the voice-processing unit records the mic and plays the game
+#endif
+bool MicOpen() {
+#if N64NET_VOICE_IOS
+    if (sUsingUnit) return true;
+#endif
+    return sCaptureDev != 0;
 }
 
 // Tests: a 440 Hz tone, one second on, one second off (exercises DTX).
@@ -225,7 +246,7 @@ void GenerateToneFrames() {
             sTonePhase += 2.0 * M_PI * 440.0 / kRate;
         }
         sTonePhase = std::fmod(sTonePhase, 2.0 * M_PI);
-        EncodeFrame(pcm);
+        EncodeFrame(pcm, false);
         sToneFrames++;
     }
 }
@@ -318,16 +339,11 @@ SDL_AudioDeviceID OpenMicrophone() {
         Log("n64net voice: can't open the microphone (%s)\n", SDL_GetError());
     }
 #if N64NET_VOICE_IOS
+    // Plain SDL mic (no voice-processing unit): loudspeaker, but no voice-chat
+    // mode, which without the unit turns the player's own voice down ~20 dB.
     char error[160];
-    const char *proc = getenv("N64NET_VOICE_PROCESSING");  // debug: 0 = no voice processing
-    const int processing = !(proc != nullptr && proc[0] == '0');
-    if (dev != 0 && !n64net_voice_ios_enable_voice_processing(processing, error, sizeof error)) {
-        Log("n64net voice: no echo cancellation (voice-chat mode not set: %s)\n", error);
-    }
-    if (dev != 0) {
-        char route[512];
-        n64net_voice_ios_describe_route(route, sizeof route);
-        Log("n64net voice: audio route at mic open: %s\n", route);
+    if (dev != 0 && !n64net_voice_ios_enable_voice_processing(0, error, sizeof error)) {
+        Log("n64net voice: audio session not set (%s)\n", error);
     }
 #endif
     return dev;
@@ -397,18 +413,52 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
     sPumpCalls = 0;
     sRunning = true;  // before the devices start calling back
 
-    if (!sConfig.test_tone) {
+#if N64NET_VOICE_IOS
+    // Echo cancellation: the voice-processing unit records the mic and plays
+    // the game's audio. N64NET_VOICE_PROCESSING=0 (debug) uses the plain SDL
+    // mic instead; N64NET_VOICE_UNIT=1 also starts the unit in test-tone mode
+    // (the mic is then only measured, e.g. to check what echo is left).
+    const char *proc = getenv("N64NET_VOICE_PROCESSING");
+    const char *unit = getenv("N64NET_VOICE_UNIT");
+    const bool want_unit = !(proc != nullptr && proc[0] == '0') &&
+                           (!sConfig.test_tone || (unit != nullptr && unit[0] == '1'));
+    sUsingUnit = false;
+    if (want_unit) {
+        char error[160];
+        SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "AVAudioSessionCategoryPlayAndRecord");  // SDL must not undo it
+        if (n64net_vpio_start(FeedCapture, error, sizeof error)) {
+            sUsingUnit = true;
+        } else {
+            Log("n64net voice: no echo cancellation (%s); using the plain microphone\n", error);
+        }
+    }
+#endif
+    if (!sConfig.test_tone && !MicOpen()) {
         sCaptureDev = OpenMicrophone();
     }
     if (sCaptureDev != 0) {
         SDL_PauseAudioDevice(sCaptureDev, 0);
     }
+#if N64NET_VOICE_IOS
+    {
+        char route[512];
+        n64net_voice_ios_describe_route(route, sizeof route);
+        Log("n64net voice: audio route at start (%s): %s\n",
+            sUsingUnit ? "echo-cancelling unit plays the game" : "no echo cancellation", route);
+    }
+#endif
     Log("n64net voice: on (%s, %s)\n",
-        sConfig.test_tone ? "test tone" : (sCaptureDev != 0 ? "microphone" : "NO microphone"),
+        sConfig.test_tone ? "test tone" : (MicOpen() ? "microphone" : "NO microphone"),
         sConfig.push_to_talk ? "push to talk" : "open mic");
 }
 
 extern "C" void n64net_voice_stop(void) {
+#if N64NET_VOICE_IOS
+    if (sUsingUnit) {
+        n64net_vpio_stop();  // the game's audio goes back to its own device
+        sUsingUnit = false;
+    }
+#endif
     if (sCaptureDev != 0) {
         SDL_CloseAudioDevice(sCaptureDev);  // waits for the callback to finish
         sCaptureDev = 0;
@@ -466,16 +516,18 @@ extern "C" void n64net_voice_pump(n64net_voice_send_fn send) {
     }
     if (sConfig.test_tone) {
         GenerateToneFrames();
-    } else if (sCaptureDev != 0 && sMicCheckMs != 0 && NowMs() >= sMicCheckMs) {
+    }
+#if N64NET_VOICE_IOS
+    if (sUsingUnit) {
+        char note[256];
+        if (n64net_vpio_check(note, sizeof note)) Log("n64net voice: %s\n", note);
+    }
+#endif
+    if (!sConfig.test_tone && sCaptureDev != 0 && sMicCheckMs != 0 && NowMs() >= sMicCheckMs) {
         // A microphone that opened but never calls back (e.g. its audio queue
         // was paused when the app's audio session changed): reopen it.
         if (sMicFrames.load() > 0) {
             sMicCheckMs = 0;
-#if N64NET_VOICE_IOS
-            char route[512];
-            n64net_voice_ios_describe_route(route, sizeof route);
-            Log("n64net voice: audio route after 2 s: %s\n", route);
-#endif
         } else if (sMicReopens < 3) {
             sMicReopens++;
             Log("n64net voice: the microphone delivers no audio; reopening it (try %d)\n", sMicReopens);
@@ -508,6 +560,13 @@ extern "C" void n64net_voice_pump(n64net_voice_send_fn send) {
                     sSent.load(), sRecv.load(), sLost.load(), sFec.load(), sLate.load(), sUnderruns.load(),
                     sTrims.load(), sSkips.load(), sDropped.load(), sAudibleFrames.load(), sMicFrames.load(),
                     sMicLoud.load(), sMicPeak.load() / 1000.0);
+#if N64NET_VOICE_IOS
+        if (sUsingUnit) {
+            char st[256];
+            n64net_vpio_stats(st, sizeof st);
+            Log("n64net voice: %s\n", st);
+        }
+#endif
         WriteDump();
     }
 }
@@ -561,4 +620,29 @@ extern "C" int n64net_voice_remote_speaking(void) {
 }
 extern "C" int n64net_voice_local_speaking(void) {
     return (sRunning && Transmitting() && NowMs() < sLocalSpeakUntilMs.load()) ? 1 : 0;
+}
+
+extern "C" int n64net_voice_output_active(void) {
+#if N64NET_VOICE_IOS
+    return n64net_vpio_active();
+#else
+    return 0;
+#endif
+}
+
+extern "C" void n64net_voice_output_write(const int16_t *stereo, int frames, int rate) {
+#if N64NET_VOICE_IOS
+    n64net_vpio_write(stereo, frames, rate);
+#else
+    (void)stereo; (void)frames; (void)rate;
+#endif
+}
+
+extern "C" int n64net_voice_output_buffered(int rate) {
+#if N64NET_VOICE_IOS
+    return n64net_vpio_buffered(rate);
+#else
+    (void)rate;
+    return 0;
+#endif
 }

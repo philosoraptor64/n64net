@@ -41,6 +41,18 @@ int n64net_voice_is_running(void);
  * while the game thread receives packets or calls start/stop. */
 void n64net_voice_mix(int16_t *stereo, int frames, int rate);
 
+/* iOS echo cancellation needs every sound the app plays to go through the
+ * same audio unit as the microphone. While this returns 1 (iOS, voice
+ * running with the microphone), send the game's final audio (after
+ * n64net_voice_mix) to n64net_voice_output_write() INSTEAD of the game's
+ * normal audio device, and use n64net_voice_output_buffered() wherever the
+ * game asks its device how much is queued. Always 0 on other platforms.
+ * Thread rules as n64net_voice_mix; writes from several threads are
+ * serialized. */
+int n64net_voice_output_active(void);
+void n64net_voice_output_write(const int16_t *stereo, int frames, int rate);
+/* Frames queued for playback, in frames at `rate`. */
+int n64net_voice_output_buffered(int rate);
 /* Call often (every game tick, and while waiting): sends captured frames. */
 void n64net_voice_pump(n64net_voice_send_fn send);
 /* Returns 1 if `data` was a voice packet (consumed), else 0. */

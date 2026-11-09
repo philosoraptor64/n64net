@@ -60,9 +60,20 @@ first existing of `SDL2::SDL2-static`, `SDL2::SDL2`, `SDL2-static`, `SDL2`).
   voice is paced by your audio clock. If your game can stall its audio (waiting for the peer), keep calling
   the mixer with silence in real time or the voice stalls too.
 - UI: `n64net_voice_set_muted` / `set_talking` (push-to-talk) / `remote_speaking` / `local_speaking`.
-- iOS: needs `NSMicrophoneUsageDescription` in Info.plist. Echo cancellation is automatic:
-  n64net sets the audio session's voice-chat mode (`AVAudioSessionModeVoiceChat`)
-  once the microphone opens.
+- iOS: needs `NSMicrophoneUsageDescription` in Info.plist. **Echo cancellation needs one change in your audio
+  output:** while voice runs with the microphone, Apple's voice-processing unit records the mic *and* plays the
+  game, so it knows what to subtract. Wherever you play a block (after `n64net_voice_mix`):
+  ```c
+  if (n64net_voice_output_active()) n64net_voice_output_write(stereo, frames, rate);  /* any rate */
+  else  /* your normal device, e.g. AudioPlayerPlayFrame */;
+  ```
+  and wherever you ask the device how much is queued, use `n64net_voice_output_buffered(rate)` while active.
+  Both are no-ops returning 0 on other platforms. The unit uses the loudspeaker (headphones win when
+  connected), restarts itself after interruptions, and logs `n64net voice: unit: ...` with the stats line.
+  Without the routing, voice-chat mode alone turns the player's own voice down ~20 dB, so n64net then
+  uses the plain microphone without echo cancellation. Debug: `N64NET_VOICE_DUMP=<file.wav>` (first 90 s of
+  the mic; on iOS relative to Documents), `N64NET_VOICE_UNIT=1` (unit also in test-tone mode; the mic is then
+  only measured), `N64NET_VOICE_BYPASS=1` (unit without processing, for A/B), `N64NET_VOICE_PROCESSING=0`.
 
 ### Input exchange (lockstep or rollback)
 1. After connecting, `n64net_input_create(&config)`: `num_players`, `local_player`, `remote_mask` (players driven
