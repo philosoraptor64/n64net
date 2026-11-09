@@ -241,6 +241,7 @@ void SDLCALL CaptureCallback(void *, Uint8 *stream, int len) {
 
 #if N64NET_VOICE_IOS
 bool sUsingUnit = false;  // the voice-processing unit records the mic and plays the game
+char sPrevCategoryHint[96];
 #endif
 bool MicOpen() {
 #if N64NET_VOICE_IOS
@@ -448,6 +449,8 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
     sUsingUnit = false;
     if (want_unit) {
         char error[160];
+        const char *prev = SDL_GetHint(SDL_HINT_AUDIO_CATEGORY);
+        snprintf(sPrevCategoryHint, sizeof sPrevCategoryHint, "%s", prev != nullptr ? prev : "");
         SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "AVAudioSessionCategoryPlayAndRecord");  // SDL must not undo it
         if (n64net_vpio_start(FeedCapture, error, sizeof error)) {
             sUsingUnit = true;
@@ -478,8 +481,12 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
 extern "C" void n64net_voice_stop(void) {
 #if N64NET_VOICE_IOS
     if (sUsingUnit) {
-        n64net_vpio_stop();  // the game's audio goes back to its own device
+        n64net_vpio_stop();  // the game's audio goes back to its own device, session restored
         sUsingUnit = false;
+        SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, sPrevCategoryHint[0] != 0 ? sPrevCategoryHint : nullptr);
+        char route[512];
+        n64net_voice_ios_describe_route(route, sizeof route);
+        Log("n64net voice: audio route after stopping: %s\n", route);
     }
 #endif
     if (sCaptureDev != 0) {

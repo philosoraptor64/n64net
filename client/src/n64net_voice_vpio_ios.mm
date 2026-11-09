@@ -60,6 +60,12 @@ double sLastCheck = 0, sLastRestart = 0;
 
 double NowSec() { return CFAbsoluteTimeGetCurrent(); }
 
+// The audio session as it was before voice chat started; put back on stop,
+// so the game's normal output isn't left in voice-call mode (iOS treats
+// output in that mode like call audio: other volume, processing).
+NSString *sSavedCategory = nil, *sSavedMode = nil;
+AVAudioSessionCategoryOptions sSavedOptions = 0;
+
 OSStatus Render(void *, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32 frames,
                 AudioBufferList *io) {
     sRenderCalls++;
@@ -186,6 +192,12 @@ void DisposeUnit() {
 
 extern "C" int n64net_vpio_start(CaptureFn capture, char *error, unsigned error_size) {
     if (sActive) return 1;
+    {
+        AVAudioSession *s = [AVAudioSession sharedInstance];
+        sSavedCategory = s.category;
+        sSavedMode = s.mode;
+        sSavedOptions = s.categoryOptions;
+    }
     if (!ConfigureSession(error, error_size)) return 0;
 
     AudioComponentDescription desc = {};
@@ -256,6 +268,14 @@ extern "C" int n64net_vpio_start(CaptureFn capture, char *error, unsigned error_
 extern "C" void n64net_vpio_stop(void) {
     sActive = false;  // producers go back to the normal output first
     DisposeUnit();
+    if (sSavedCategory != nil) {
+        AVAudioSession *s = [AVAudioSession sharedInstance];
+        [s overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:nil];
+        [s setCategory:sSavedCategory mode:sSavedMode options:sSavedOptions error:nil];
+        [s setActive:YES error:nil];
+        sSavedCategory = nil;
+        sSavedMode = nil;
+    }
     std::lock_guard<std::mutex> lock(sWriteLock);
     if (sConverter != nullptr) {
         AudioConverterDispose(sConverter);
