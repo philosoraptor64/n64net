@@ -46,8 +46,14 @@ first existing of `SDL2::SDL2-static`, `SDL2::SDL2`, `SDL2-static`, `SDL2`).
 3. `n64net_rendezvous_connect(sock, &config, &result)` blocks until connected; then send gameplay packets
    to `result.peer`. If `result.relayed` is 1 that address is the server, which forwards everything that
    doesn't start with `N64R1 `. On failure, `result.error` says why (`version <host build>`, `auth`,
-   `noroom`, `timeout`, ...): tell the player.
+   `noroom`, `timeout`, ...): tell the player. **Accept the peer's packets from either `result.peer` or
+   `result.server`** (non-control datagrams from the server are the peer's, relayed): rarely one side ends
+   up direct and the other relayed, and accepting both keeps that working.
 4. A host leaving a room (e.g. after a match) calls `n64net_rendezvous_bye`.
+5. Invite passes (links without the password): the host calls `n64net_rendezvous_request_invite(sock,
+   &config, ttl_secs)`; whoever reads the socket passes the server's answer to
+   `n64net_rendezvous_parse_invite()`, which yields the pass. The guest sets `config.invite_pass` (and no
+   password): it may then join that room only, until the pass expires (default 24 h, max 7 days).
 
 ### Voice chat
 - When connected: `n64net_voice_start(&config)` (`enabled`, `push_to_talk`, `test_tone` for tests without a

@@ -13,10 +13,12 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
     JOIN <game> <code> <lan_ip:port>     join a room (repeat until PEER)
     RELAY <code>                         switch this room to relaying
     BYE <code>                           leave
+    INVITE <code> <ttl_secs>             (password only) get an invite pass
   server -> client
     ROOM <code>                          room held for this host
     PEER <code> <public_ip:port> <lan_ip:port> <host|guest>
     RELAYOK <code>
+    INVITE <code> <pass>                 a pass for that room (see below)
     ERR <reason>                         nosuchroom | full | taken | game | badcode | busy | auth
     ERR version <host_build>             same game, different build (see below)
 
@@ -35,6 +37,14 @@ HMAC-SHA256(password, "<CMD> <fields...> <unix_time>"). The password never
 crosses the network; the time limits replay to a few minutes. A server with a
 password answers bad or missing signatures with "ERR auth" and ignores an
 address after repeated failures.
+
+Invite passes: so invite links needn't carry the password, a client that
+knows it asks `INVITE <code> <ttl>` and gets `INVITE <code> <expiry>-<mac>`,
+mac = first 24 hex digits of HMAC-SHA256(key, "invite <code> <expiry>"), key =
+HMAC-SHA256(password, "n64net invite key"). A guest may then sign JOIN, RELAY
+and BYE for THAT room with `pass <pass>` in place of `<unix_time> <mac>`,
+until the expiry. A pass cannot HOST or make passes, and bad passes count as
+failed passwords. The key follows the password, so passes survive restarts.
 
 Usage: rendezvous.py [--port 7780] [--bind 0.0.0.0] [--public-ip A.B.C.D]
                      [--password-file PATH] [--natpmp]
@@ -58,7 +68,9 @@ ROOM_IDLE_SECS = 600        # forget rooms idle this long
 RELAY_IDLE_SECS = 120       # forget a relaying room with no traffic this long
 MAX_ROOMS = 5000
 MAX_PACKET = 1500
-AUTH_FIELDS = {"HOST": 3, "JOIN": 3, "RELAY": 1, "BYE": 1}  # fields before <time> <mac>
+AUTH_FIELDS = {"HOST": 3, "JOIN": 3, "RELAY": 1, "BYE": 1, "INVITE": 2}  # fields before <time> <mac>
+PASS_COMMANDS = {"JOIN": 1, "RELAY": 0, "BYE": 0}  # may use an invite pass; index of <code>
+INVITE_MAX_TTL = 7 * 24 * 3600
 AUTH_WINDOW_SECS = 300      # allowed clock difference
 AUTH_MAX_FAILURES = 10      # per address within AUTH_BAN_SECS ...
 AUTH_BAN_SECS = 600         # ... then that address is ignored this long
@@ -190,7 +202,9 @@ class Rendezvous(asyncio.DatagramProtocol):
         if fail is not None and fail[1] >= AUTH_MAX_FAILURES:
             return None  # silently ignored while banned
         ok = False
-        if len(args) == n + 2:
+        if len(args) == n + 2 and args[n] == "pass" and cmd in PASS_COMMANDS:
+            ok = self.pass_ok(args[PASS_COMMANDS[cmd]].upper(), args[n + 1])
+        elif len(args) == n + 2:
             try:
                 stamp = int(args[n])
             except ValueError:
@@ -209,6 +223,33 @@ class Rendezvous(asyncio.DatagramProtocol):
                 log.warning("ignoring %s for %ds after %d bad passwords", ip, AUTH_BAN_SECS, fail[1])
         self.send(addr, "ERR auth")
         return None
+
+    def invite_mac(self, code, expiry):
+        key = hmac.new(self.password, b"n64net invite key", hashlib.sha256).digest()
+        return hmac.new(key, f"invite {code} {expiry}".encode(), hashlib.sha256).hexdigest()[:24]
+
+    def pass_ok(self, code, token):
+        expiry, _, mac = token.partition("-")
+        try:
+            expiry_n = int(expiry)
+        except ValueError:
+            return False
+        if expiry_n < time.time() or not valid_code(code):
+            return False
+        return hmac.compare_digest(self.invite_mac(code, expiry_n), mac.lower())
+
+    def cmd_INVITE(self, addr, args):
+        code = args[0].upper()
+        if not valid_code(code):
+            self.send(addr, "ERR badcode")
+            return
+        ttl = max(60, min(int(args[1]), INVITE_MAX_TTL))
+        expiry = int(time.time()) + ttl
+        if self.password is None:
+            self.send(addr, f"INVITE {code} {expiry}-open")  # open server: any pass works
+            return
+        log.info("invite pass for room %s (%d s) to %s", code, ttl, fmt_addr(addr))
+        self.send(addr, f"INVITE {code} {expiry}-{self.invite_mac(code, expiry)}")
 
     def cmd_HOST(self, addr, args):
         game, code, lan = args[0], args[1].upper(), args[2]

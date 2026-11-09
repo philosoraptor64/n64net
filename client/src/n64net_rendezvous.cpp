@@ -25,7 +25,7 @@ constexpr size_t kPrefixLen = 6;
 constexpr int kRegisterIntervalMs = 1000;
 constexpr int kPunchIntervalMs = 100;
 constexpr int kPunchTimeoutMs = 5000;   // then fall back to the relay
-constexpr int kPunchLingerMs = 500;     // keep answering after success
+constexpr int kPunchLingerMs = 1000;    // keep answering (and acking) after success
 constexpr int kRelayRequestIntervalMs = 300;
 constexpr int kRelayTimeoutMs = 5000;
 
@@ -96,6 +96,9 @@ class Session {
         if (cfg.password != nullptr) {
             mPassword = cfg.password;
         }
+        if (cfg.invite_pass != nullptr) {
+            mInvitePass = cfg.invite_pass;
+        }
         if (cfg.room != nullptr) {
             for (const char *c = cfg.room; *c && mRoom.size() < 4; c++) {
                 mRoom += (char)toupper((unsigned char)*c);
@@ -114,7 +117,8 @@ class Session {
     // password itself is never sent (see rendezvous.py).
     void SendToServer(const std::string &msg) {
         if (mPassword.empty()) {
-            Send(mServer, msg);
+            // A guest with an invite pass signs JOIN/RELAY/BYE with it.
+            Send(mServer, mInvitePass.empty() || mIsHost ? msg : msg + " pass " + mInvitePass);
             return;
         }
         std::string signed_msg = msg + " " + std::to_string((long long)std::time(nullptr));
@@ -177,6 +181,7 @@ class Session {
     std::string mRoom;
     std::string mPassword;
     sockaddr_in mServer{};
+    std::string mInvitePass;
     std::string mLan;
     std::vector<sockaddr_in> mCandidates;
     sockaddr_in mPeer{};
@@ -264,9 +269,16 @@ bool Session::Punch() {
         if (!connected && now - start >= kPunchTimeoutMs) {
             return false;
         }
-        if (!connected && now >= next_punch) {
-            for (auto &c : mCandidates) {
-                Send(c, "PUNCH " + mRoom + " " + role);
+        if (now >= next_punch) {
+            if (!connected) {
+                for (auto &c : mCandidates) {
+                    Send(c, "PUNCH " + mRoom + " " + role);
+                }
+            } else {
+                // Connected: keep acking on the working path for a moment, so
+                // a peer whose own PUNCHes never got through still hears us
+                // and goes direct too (instead of falling back to the relay).
+                Send(mPeer, "PUNCHACK " + mRoom + " " + role);
             }
             next_punch = now + kPunchIntervalMs;
         }
@@ -299,6 +311,12 @@ bool Session::Punch() {
         if (f[0] == "PUNCH") {
             // Answer from wherever it came: that is the hole the peer opened.
             Send(from, "PUNCHACK " + mRoom + " " + role);
+            // ...and dial it ourselves too: the address the server reported
+            // can differ from the one the peer's packets really come from
+            // (a NAT that rewrites ports, or a host registered via 127.0.0.1).
+            if (!from_candidate) {
+                mCandidates.push_back(from);
+            }
         } else if (f[0] == "PUNCHACK" && !connected) {
             mPeer = from;
             connected = true;
@@ -374,6 +392,7 @@ int Session::Run(N64NetRendezvousResult *out) {
         relayed = true;
     }
     out->peer = mPeer;
+    out->server = mServer;
     out->relayed = relayed ? 1 : 0;
     out->is_host = mIsHost ? 1 : 0;
     std::snprintf(out->room, sizeof(out->room), "%s", mRoom.c_str());
@@ -396,6 +415,8 @@ extern "C" void n64net_rendezvous_bye(int sock, const N64NetRendezvousConfig *co
     if (config->password != nullptr && config->password[0] != '\0') {
         msg += " " + std::to_string((long long)std::time(nullptr));
         msg += " " + n64net::HmacSha256Hex(config->password, msg).substr(0, 32);
+    } else if (config->invite_pass != nullptr && config->invite_pass[0] != '\0') {
+        msg += std::string(" pass ") + config->invite_pass;
     }
     const std::string pkt = kPrefix + msg;
     for (int i = 0; i < 3; i++) {
@@ -423,3 +444,53 @@ extern "C" void n64net_rendezvous_bye(int, const N64NetRendezvousConfig *) {
 }
 
 #endif
+
+extern "C" int n64net_rendezvous_request_invite(int sock, const N64NetRendezvousConfig *config, int ttl_secs) {
+    sockaddr_in server{};
+    if (sock < 0 || config == nullptr || config->server == nullptr || config->room == nullptr ||
+        config->password == nullptr || config->password[0] == '\0' || !Resolve(config->server, &server)) {
+        return -1;
+    }
+    std::string room;
+    for (const char *c = config->room; *c && room.size() < 4; c++) {
+        room += (char)toupper((unsigned char)*c);
+    }
+    std::string msg = "INVITE " + room + " " + std::to_string(ttl_secs > 0 ? ttl_secs : 24 * 3600);
+    msg += " " + std::to_string((long long)std::time(nullptr));
+    msg += " " + n64net::HmacSha256Hex(config->password, msg).substr(0, 32);
+    const std::string pkt = kPrefix + msg;
+    return sendto(sock, pkt.data(), pkt.size(), 0, (const sockaddr *)&server, sizeof(server)) > 0 ? 0 : -1;
+}
+
+extern "C" int n64net_rendezvous_parse_invite(const void *data, int size, char room_out[8], char *pass_out,
+                                              int pass_cap) {
+    if (data == nullptr || size <= (int)kPrefixLen || size > 200 || pass_out == nullptr || pass_cap <= 0) {
+        return 0;
+    }
+    const char *p = static_cast<const char *>(data);
+    if (std::memcmp(p, kPrefix, kPrefixLen) != 0) {
+        return 0;
+    }
+    std::vector<std::string> f;
+    {
+        std::string word;
+        for (int i = (int)kPrefixLen; i < size; i++) {
+            const char c = p[i];
+            if (c == ' ' || c == '\n' || c == '\r' || c == '\0') {
+                if (!word.empty()) f.push_back(word);
+                word.clear();
+            } else {
+                word += c;
+            }
+        }
+        if (!word.empty()) f.push_back(word);
+    }
+    if (f.size() != 3 || f[0] != "INVITE" || (int)f[2].size() >= pass_cap) {
+        return 0;
+    }
+    if (room_out != nullptr) {
+        std::snprintf(room_out, 8, "%s", f[1].c_str());
+    }
+    std::snprintf(pass_out, pass_cap, "%s", f[2].c_str());
+    return 1;
+}
