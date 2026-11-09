@@ -71,4 +71,7 @@ if (N64NET_BUILD_TESTS)
     add_executable(n64net_input_test tests/input_test.cpp client/src/n64net_input.cpp)
     target_include_directories(n64net_input_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/client/include)
     target_compile_features(n64net_input_test PRIVATE cxx_std_17)
+    # Offline check of the voice leveler on a recording (N64NET_VOICE_DUMP WAV).
+    add_executable(n64net_voice_dsp_tool tests/voice_dsp_tool.cpp)
+    target_compile_features(n64net_voice_dsp_tool PRIVATE cxx_std_17)
 endif()

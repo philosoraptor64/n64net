@@ -11,6 +11,7 @@
  * next packet, else Opus PLC), skips ahead if the buffer grows past ~240 ms,
  * and resamples 48 kHz to the game's rate (linear). */
 #include "n64net_voice.h"
+#include "n64net_voice_dsp.h"
 
 #if __has_include(<SDL2/SDL.h>)
 #include <SDL2/SDL.h>
@@ -101,6 +102,13 @@ int sPcmPos = kFrame;
 float sResPrev = 0.0f, sResCur = 0.0f;  // resampler: two 48 kHz samples
 double sResPhase = 0.0;
 constexpr float kVoiceGain = 1.4f;
+// Send side: speech is levelled before encoding (quiet talking at arm's
+// length comes out like a raised voice). Receive side: the game's audio dips
+// while the other player talks. Debug: N64NET_VOICE_LEVELER=0, N64NET_VOICE_DUCK=0.
+n64net_dsp::VoiceLeveler sLeveler;
+n64net_dsp::Ducker sDucker;
+bool sLevelerOn = true, sDuckOn = true;
+std::atomic<uint32_t> sSentLoud{0};
 
 std::atomic<int> sMuted{0};
 std::atomic<int> sTalking{0};
@@ -178,9 +186,16 @@ void EncodeFrame(const int16_t *pcm, bool from_mic = true) {
         }
         if (sConfig.test_tone) return;  // tests: the mic is only measured, the tone is sent
     }
+    int16_t leveled[kFrame];
+    if (from_mic) {
+        std::memcpy(leveled, pcm, sizeof leveled);
+        if (sLevelerOn) sLeveler.Process(leveled, kFrame);  // also while muted, so the gain stays current
+        pcm = leveled;
+    }
     if (!Transmitting() || sEncoder == nullptr) {
         return;
     }
+    if (Rms(pcm, kFrame) > kSpeakingRms) sSentLoud++;
     Packet p;
     int n = opus_encode(sEncoder, pcm, kFrame, p.data + kHeader, kMaxPayload);
     if (n < 0) {
@@ -387,6 +402,7 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
         std::lock_guard<std::mutex> mix(sMixLock);
         sDecoder = decoder;
         sPlaying = false;
+        sDucker.Reset();
         sPcmPos = kFrame;
         sResPrev = sResCur = 0.0f;
         sResPhase = 0.0;
@@ -397,6 +413,13 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
     sToneClock = std::chrono::steady_clock::now();
     sSent = sRecv = sLost = sFec = sLate = sUnderruns = sSkips = sDropped = sTrims = sAudibleFrames = 0;
     sMicFrames = sMicLoud = sMicPeak = 0;
+    sSentLoud = 0;
+    sLeveler.Reset();
+    {
+        const char *l = getenv("N64NET_VOICE_LEVELER"), *d = getenv("N64NET_VOICE_DUCK");
+        sLevelerOn = !(l != nullptr && l[0] == '0');
+        sDuckOn = !(d != nullptr && d[0] == '0');
+    }
     sMicReopens = 0;
     sMicCheckMs = NowMs() + 2000;
     if (const char *dump = getenv("N64NET_VOICE_DUMP"); dump != nullptr && dump[0] != 0 && sDumpBuf == nullptr) {
@@ -491,7 +514,9 @@ extern "C" void n64net_voice_mix(int16_t *stereo, int frames, int rate) {
         return;
     }
     const double step = static_cast<double>(kRate) / rate;
+    const bool talking = sDuckOn && NowMs() < sRemoteSpeakUntilMs.load();
     for (int i = 0; i < frames; i++) {
+        const float duck = sDucker.Next(talking, rate);
         float v = (sResPrev + (sResCur - sResPrev) * static_cast<float>(sResPhase)) * kVoiceGain;
         sResPhase += step;
         while (sResPhase >= 1.0) {
@@ -500,7 +525,7 @@ extern "C" void n64net_voice_mix(int16_t *stereo, int frames, int rate) {
             sResCur = Pull48k();
         }
         for (int ch = 0; ch < 2; ch++) {
-            int s = stereo[i * 2 + ch] + static_cast<int>(v);
+            int s = static_cast<int>(stereo[i * 2 + ch] * duck) + static_cast<int>(v);
             stereo[i * 2 + ch] = static_cast<int16_t>(s > 32767 ? 32767 : (s < -32768 ? -32768 : s));
         }
     }
@@ -556,10 +581,10 @@ extern "C" void n64net_voice_pump(n64net_voice_send_fn send) {
 
     if ((++sPumpCalls % 600) == 0) {  // ~10 s at 60 calls/s
         Log("n64net voice: sent %u received %u lost %u (fec %u) late %u underruns %u trims %u skips %u "
-                    "dropped %u audible %u mic %u (loud %u, peak %.3f)\n",
+                    "dropped %u audible %u mic %u (loud %u, peak %.3f) sent loud %u gain %.1f\n",
                     sSent.load(), sRecv.load(), sLost.load(), sFec.load(), sLate.load(), sUnderruns.load(),
                     sTrims.load(), sSkips.load(), sDropped.load(), sAudibleFrames.load(), sMicFrames.load(),
-                    sMicLoud.load(), sMicPeak.load() / 1000.0);
+                    sMicLoud.load(), sMicPeak.load() / 1000.0, sSentLoud.load(), sLeveler.Gain());
 #if N64NET_VOICE_IOS
         if (sUsingUnit) {
             char st[256];

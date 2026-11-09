@@ -74,6 +74,11 @@ first existing of `SDL2::SDL2-static`, `SDL2::SDL2`, `SDL2-static`, `SDL2`).
   uses the plain microphone without echo cancellation. Debug: `N64NET_VOICE_DUMP=<file.wav>` (first 90 s of
   the mic; on iOS relative to Documents), `N64NET_VOICE_UNIT=1` (unit also in test-tone mode; the mic is then
   only measured), `N64NET_VOICE_BYPASS=1` (unit without processing, for A/B), `N64NET_VOICE_PROCESSING=0`.
+- Levels: the sender levels speech before encoding (`client/src/n64net_voice_dsp.h`: high-pass, noise-floor
+  tracker, automatic gain to -20 dBFS speech up to +18 dB, limiter), so quiet talking arrives like a raised
+  voice; the receiver ducks the game's audio by 6 dB while the other player talks (inside `n64net_voice_mix`).
+  Debug: `N64NET_VOICE_LEVELER=0`, `N64NET_VOICE_DUCK=0`. Check a recording offline with
+  `n64net_voice_dsp_tool in.wav [out.wav] [pre-gain]` (built with `N64NET_BUILD_TESTS`).
 
 ### Input exchange (lockstep or rollback)
 1. After connecting, `n64net_input_create(&config)`: `num_players`, `local_player`, `remote_mask` (players driven
