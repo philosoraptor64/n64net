@@ -27,6 +27,10 @@
 #include <mutex>
 #include <vector>
 
+#if N64NET_VOICE_IOS
+extern "C" int n64net_voice_ios_enable_voice_processing(char *error, unsigned error_size);  // n64net_voice_ios.mm
+#endif
+
 namespace {
 
 constexpr int kRate = 48000;
@@ -270,6 +274,12 @@ SDL_AudioDeviceID OpenMicrophone() {
     if (dev == 0) {
         Log("n64net voice: can't open the microphone (%s)\n", SDL_GetError());
     }
+#if N64NET_VOICE_IOS
+    char error[160];
+    if (dev != 0 && !n64net_voice_ios_enable_voice_processing(error, sizeof error)) {
+        Log("n64net voice: no echo cancellation (voice-chat mode not set: %s)\n", error);
+    }
+#endif
     return dev;
 }
 

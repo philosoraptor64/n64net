@@ -200,8 +200,13 @@ struct n64net_input {
         std::sort(sorted, sorted + n);
         const uint32_t p90 = sorted[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1];
         const uint32_t tick_usecs = 1000000u / cfg.ticks_per_second;
-        uint32_t ticks = (p90 / 2 + tick_usecs - 1) / tick_usecs;
-        ticks = ticks > 0 ? ticks - 1 : 0;
+        // An input for tick t leaves the peer at its tick t - delay and must
+        // arrive before our tick t starts; the two frame clocks are up to a
+        // tick out of phase. So: the one-way time (half the round trip, less
+        // the frame of polling measured in it) plus 8 ms of margin, rounded
+        // up, plus one tick for the phase. (Proposed by the Mario Kart port.)
+        const uint32_t one_way = (p90 > tick_usecs ? p90 - tick_usecs : 0) / 2 + 8000;
+        const uint32_t ticks = (one_way + tick_usecs - 1) / tick_usecs + 1;
         return std::min(std::max(ticks, auto_min), auto_max);
     }
     void UpdateAutoDelay(uint64_t now);

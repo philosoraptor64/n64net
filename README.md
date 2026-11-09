@@ -60,8 +60,9 @@ first existing of `SDL2::SDL2-static`, `SDL2::SDL2`, `SDL2-static`, `SDL2`).
   voice is paced by your audio clock. If your game can stall its audio (waiting for the peer), keep calling
   the mixer with silence in real time or the voice stalls too.
 - UI: `n64net_voice_set_muted` / `set_talking` (push-to-talk) / `remote_speaking` / `local_speaking`.
-- iOS: needs `NSMicrophoneUsageDescription` in Info.plist. For echo cancellation, set
-  `AVAudioSessionModeVoiceChat` after the microphone opens.
+- iOS: needs `NSMicrophoneUsageDescription` in Info.plist. Echo cancellation is automatic:
+  n64net sets the audio session's voice-chat mode (`AVAudioSessionModeVoiceChat`)
+  once the microphone opens.
 
 ### Input exchange (lockstep or rollback)
 1. After connecting, `n64net_input_create(&config)`: `num_players`, `local_player`, `remote_mask` (players driven

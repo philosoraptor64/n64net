@@ -23,6 +23,14 @@ target_compile_features(n64net PRIVATE cxx_std_17)
 
 if (N64NET_VOICE)
     target_sources(n64net PRIVATE client/src/n64net_voice.cpp client/include/n64net_voice.h)
+    if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        # Echo cancellation: the audio session's voice-chat mode, set when the mic opens.
+        enable_language(OBJCXX)
+        target_sources(n64net PRIVATE client/src/n64net_voice_ios.mm)
+        set_source_files_properties(client/src/n64net_voice_ios.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        target_compile_definitions(n64net PRIVATE N64NET_VOICE_IOS=1)
+        target_link_libraries(n64net PRIVATE "-framework AVFoundation")
+    endif()
 
     if (NOT N64NET_SDL2_TARGET)
         foreach (candidate SDL2::SDL2-static SDL2::SDL2 SDL2-static SDL2)
