@@ -29,6 +29,7 @@
 
 #if N64NET_VOICE_IOS
 extern "C" int n64net_voice_ios_enable_voice_processing(char *error, unsigned error_size);  // n64net_voice_ios.mm
+extern "C" void n64net_voice_ios_describe_route(char *out, unsigned out_size);
 #endif
 
 namespace {
@@ -97,6 +98,11 @@ std::atomic<int64_t> sLocalSpeakUntilMs{0};
 // stats (logged from the pump)
 std::atomic<uint32_t> sSent{0}, sRecv{0}, sLost{0}, sFec{0}, sLate{0}, sUnderruns{0}, sSkips{0}, sDropped{0}, sTrims{0};
 std::atomic<uint32_t> sAudibleFrames{0};
+// Microphone health: frames the capture callback delivered, how many were
+// above the speaking level, and the loudest frame (RMS x 1000).
+std::atomic<uint32_t> sMicFrames{0}, sMicLoud{0}, sMicPeak{0};
+uint64_t sMicCheckMs = 0;   // when to check that the microphone delivers audio
+int sMicReopens = 0;
 uint32_t sPumpCalls = 0;
 
 int64_t NowMs() {
@@ -126,6 +132,12 @@ float Rms(const int16_t *pcm, int n) {
 
 // One 20 ms frame of local audio -> a queued packet (when transmitting).
 void EncodeFrame(const int16_t *pcm) {
+    {
+        const uint32_t level = static_cast<uint32_t>(Rms(pcm, kFrame) * 1000.0f);
+        sMicFrames++;
+        if (level > static_cast<uint32_t>(kSpeakingRms * 1000.0f)) sMicLoud++;
+        if (level > sMicPeak.load()) sMicPeak = level;
+    }
     if (!Transmitting() || sEncoder == nullptr) {
         return;
     }
@@ -279,6 +291,11 @@ SDL_AudioDeviceID OpenMicrophone() {
     if (dev != 0 && !n64net_voice_ios_enable_voice_processing(error, sizeof error)) {
         Log("n64net voice: no echo cancellation (voice-chat mode not set: %s)\n", error);
     }
+    if (dev != 0) {
+        char route[512];
+        n64net_voice_ios_describe_route(route, sizeof route);
+        Log("n64net voice: audio route at mic open: %s\n", route);
+    }
 #endif
     return dev;
 }
@@ -330,6 +347,9 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
     sToneFrames = 0;
     sToneClock = std::chrono::steady_clock::now();
     sSent = sRecv = sLost = sFec = sLate = sUnderruns = sSkips = sDropped = sTrims = sAudibleFrames = 0;
+    sMicFrames = sMicLoud = sMicPeak = 0;
+    sMicReopens = 0;
+    sMicCheckMs = NowMs() + 2000;
     sPumpCalls = 0;
     sRunning = true;  // before the devices start calling back
 
@@ -402,6 +422,27 @@ extern "C" void n64net_voice_pump(n64net_voice_send_fn send) {
     }
     if (sConfig.test_tone) {
         GenerateToneFrames();
+    } else if (sCaptureDev != 0 && sMicCheckMs != 0 && NowMs() >= sMicCheckMs) {
+        // A microphone that opened but never calls back (e.g. its audio queue
+        // was paused when the app's audio session changed): reopen it.
+        if (sMicFrames.load() > 0) {
+            sMicCheckMs = 0;
+#if N64NET_VOICE_IOS
+            char route[512];
+            n64net_voice_ios_describe_route(route, sizeof route);
+            Log("n64net voice: audio route after 2 s: %s\n", route);
+#endif
+        } else if (sMicReopens < 3) {
+            sMicReopens++;
+            Log("n64net voice: the microphone delivers no audio; reopening it (try %d)\n", sMicReopens);
+            SDL_CloseAudioDevice(sCaptureDev);
+            sCaptureDev = OpenMicrophone();
+            if (sCaptureDev != 0) SDL_PauseAudioDevice(sCaptureDev, 0);
+            sMicCheckMs = NowMs() + 2000;
+        } else {
+            Log("n64net voice: the microphone still delivers no audio; giving up\n");
+            sMicCheckMs = 0;
+        }
     }
     Packet batch[kMaxOutgoing];
     int count = 0;
@@ -419,9 +460,10 @@ extern "C" void n64net_voice_pump(n64net_voice_send_fn send) {
 
     if ((++sPumpCalls % 600) == 0) {  // ~10 s at 60 calls/s
         Log("n64net voice: sent %u received %u lost %u (fec %u) late %u underruns %u trims %u skips %u "
-                    "dropped %u audible %u\n",
+                    "dropped %u audible %u mic %u (loud %u, peak %.3f)\n",
                     sSent.load(), sRecv.load(), sLost.load(), sFec.load(), sLate.load(), sUnderruns.load(),
-                    sTrims.load(), sSkips.load(), sDropped.load(), sAudibleFrames.load());
+                    sTrims.load(), sSkips.load(), sDropped.load(), sAudibleFrames.load(), sMicFrames.load(),
+                    sMicLoud.load(), sMicPeak.load() / 1000.0);
     }
 }
 
