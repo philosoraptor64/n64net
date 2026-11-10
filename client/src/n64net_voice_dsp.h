@@ -7,7 +7,11 @@
 //  3. automatic gain brings speech towards kTarget RMS (-20 dBFS): rises
 //     slowly (~8 dB/s) and only on speech, falls faster, and is held in
 //     pauses, so the start of the next phrase is already at the right level;
-//     background frames get at most kNoiseGain, so noise isn't pumped up;
+//     at most kMaxGain (+12 dB: more picked up keyboard and room noise);
+//  3b. a noise gate: speech needs kSpeechMin RMS (about -44 dBFS before gain)
+//     as well as 3x the noise floor; between phrases (after a 500 ms hold)
+//     the signal fades to kGateFloor (-20 dB) over ~100 ms, and opens again
+//     within one frame when speech starts;
 //  4. a peak limiter (fast attack, ~80 ms release) plus a soft clip keep
 //     shouts and plosives from distorting.
 // Gain changes are interpolated across each frame (no zipper noise).
@@ -21,9 +25,11 @@ namespace n64net_dsp {
 class VoiceLeveler {
 public:
     static constexpr float kTarget = 0.10f;    // speech RMS after gain
-    static constexpr float kMaxGain = 8.0f;    // +18 dB
+    static constexpr float kMaxGain = 4.0f;    // +12 dB
     static constexpr float kMinGain = 0.5f;
-    static constexpr float kNoiseGain = 2.0f;  // at most this much on background
+    static constexpr float kNoiseGain = 1.0f;  // at most this much on background (before the gate)
+    static constexpr float kSpeechMin = 0.006f; // -44 dBFS: quieter frames are never speech
+    static constexpr float kGateFloor = 0.1f;   // -20 dB between phrases
     static constexpr float kLimit = 0.60f;     // limiter threshold (peak)
 
     void Reset() { *this = VoiceLeveler(); }
@@ -50,7 +56,7 @@ public:
             mNoise *= 1.0072f;
         }
         mNoise = std::max(mNoise, 1e-4f);
-        const bool speech = rms > std::max(mNoise * 3.0f, 0.002f);
+        const bool speech = rms > std::max(mNoise * 3.0f, kSpeechMin);
 
         // 3. automatic gain
         if (speech) {
@@ -64,7 +70,10 @@ public:
         } else if (mHangover > 0) {
             mHangover--;
         }
-        const float frameGain = (speech || mHangover > 0) ? mGain : std::min(mGain, kNoiseGain);
+        const bool open = speech || mHangover > 0;
+        // gate: open at once, close over ~100 ms (-4 dB per frame)
+        mGate = open ? 1.0f : std::max(kGateFloor, mGate * 0.63f);
+        const float frameGain = (open ? mGain : std::min(mGain, kNoiseGain)) * mGate;
 
         // 4. apply (gain ramped across the frame), limit, soft clip
         const float g0 = mLastGain, g1 = frameGain;
@@ -83,6 +92,7 @@ public:
     }
 
     float Gain() const { return mGain; }
+    float GateLevel() const { return mGate; }
     float NoiseFloor() const { return mNoise; }
 
 private:
@@ -99,6 +109,7 @@ private:
     float mHp = 0.0f, mHpPrev = 0.0f;
     float mNoise = 0.01f;
     float mGain = 2.0f, mLastGain = 2.0f;
+    float mGate = 1.0f;
     float mEnv = 0.0f;
     int mHangover = 0;
 };
