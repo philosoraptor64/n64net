@@ -26,6 +26,9 @@ typedef struct N64NetRendezvousConfig {
     /* Guest without the password: an invite pass for `room` (from the host's
      * n64net_rendezvous_request_invite). Used only when `password` is empty. */
     const char *invite_pass;
+    /* Optional: set *cancel to non-zero (from any thread) to stop waiting for
+     * the other player; connect then fails with error "cancelled". */
+    const volatile int *cancel;
 } N64NetRendezvousConfig;
 
 typedef struct N64NetRendezvousResult {
@@ -39,7 +42,7 @@ typedef struct N64NetRendezvousResult {
     int is_host;             /* role (a joiner is never host) */
     char room[8];
     /* On failure, why (for the player): "version <host_build>", "auth",
-     * "noroom" (the code was never hosted), "timeout", "full", "taken",
+     * "noroom" (the code was never hosted), "timeout", "cancelled", "full", "taken",
      * "game", "badcode", "busy", "resolve", "relay", "args". */
     char error[64];
 } N64NetRendezvousResult;

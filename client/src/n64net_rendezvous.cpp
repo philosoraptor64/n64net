@@ -196,6 +196,11 @@ bool Session::WaitForPeer() {
     char buf[1600];
 
     while (NowMs() < deadline) {
+        if (mCfg.cancel && *mCfg.cancel) {
+            mLog("n64net: stopped waiting (cancelled)\n");
+            mError = "cancelled";
+            return false;
+        }
         if (NowMs() >= next_register) {
             Register();
             next_register = NowMs() + kRegisterIntervalMs;
