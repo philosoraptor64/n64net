@@ -43,10 +43,12 @@ typedef struct n64net_pad {
     uint16_t buttons;
     int8_t stick_x;
     int8_t stick_y;
-    /* Right stick (added for Perfect Dark's aiming). Games without one leave it 0: packets then keep
-       the original 4-byte-per-frame format, so older builds still understand them. */
+    /* Extended input (added for Perfect Dark): the right stick and button bits 16-31 (ports that add
+       buttons beyond the N64's 16). Games that leave them 0 keep the original 4-byte-per-frame
+       packets, so older builds still understand them. */
     int8_t rstick_x;
     int8_t rstick_y;
+    uint16_t buttons_hi;
 } n64net_pad;
 
 typedef struct n64net_input n64net_input;

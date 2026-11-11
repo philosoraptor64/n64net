@@ -44,6 +44,7 @@ struct Game {  // the "simulation": two points moved by the pads, plus an RNG
             x[p] += pads[p].stick_x + 3 * pads[p].rstick_x;
             y[p] += pads[p].stick_y - 5 * pads[p].rstick_y;
             if (pads[p].buttons & 1) { rng = rng * 69069u + 1u; x[p] ^= (int32_t)(rng >> 20); }
+            if (pads[p].buttons_hi & 1) y[p] ^= 0x5a5a;
         }
         tick++;
     }
@@ -115,6 +116,7 @@ n64net_pad PadFor(Peer &p, uint32_t tick) {
     if (p.id == 0 && ((s >> 24) & 3) != 0) {
         pad.rstick_x = (int8_t)((int)((s >> 4) % 161) - 80);
         pad.rstick_y = (int8_t)((int)((s >> 20) % 161) - 80);
+        pad.buttons_hi = (uint16_t)((s >> 27) & 1);
     }
     return pad;
 }
