@@ -41,8 +41,8 @@ struct Game {  // the "simulation": two points moved by the pads, plus an RNG
     uint32_t tick;
     void Step(const n64net_pad pads[2]) {
         for (int p = 0; p < 2; p++) {
-            x[p] += pads[p].stick_x;
-            y[p] += pads[p].stick_y;
+            x[p] += pads[p].stick_x + 3 * pads[p].rstick_x;
+            y[p] += pads[p].stick_y - 5 * pads[p].rstick_y;
             if (pads[p].buttons & 1) { rng = rng * 69069u + 1u; x[p] ^= (int32_t)(rng >> 20); }
         }
         tick++;
@@ -106,10 +106,16 @@ n64net_pad PadFor(Peer &p, uint32_t tick) {
     // Each player changes input every few ticks (like a human), deterministic per peer.
     uint32_t s = p.pad_seed ^ (tick / 7) * 2654435761u;
     s ^= s >> 13; s *= 0x5bd1e995u; s ^= s >> 15;
-    n64net_pad pad;
+    n64net_pad pad = {};
     pad.buttons = (uint16_t)(s & 0x0003);
     pad.stick_x = (int8_t)((int)((s >> 8) % 161) - 80);
     pad.stick_y = (int8_t)((int)((s >> 16) % 161) - 80);
+    // Right stick: player 0 uses it in bursts (packets switch between the old 4-byte frames and the
+    // right-stick format), player 1 never does (old format only).
+    if (p.id == 0 && ((s >> 24) & 3) != 0) {
+        pad.rstick_x = (int8_t)((int)((s >> 4) % 161) - 80);
+        pad.rstick_y = (int8_t)((int)((s >> 20) % 161) - 80);
+    }
     return pad;
 }
 

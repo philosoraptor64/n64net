@@ -1,9 +1,9 @@
 /* n64net input exchange (see n64net_input.h).
  *
  * Wire format, all integers big endian:
- *   input:  u32 magic 'N64I' | u8 version | u8 type=0 | u8 player | u8 count |
+ *   input:  u32 magic 'N64I' | u8 version | u8 type=0 (0x80 = with right stick) | u8 player | u8 count |
  *           u32 session | u32 ack[4] (next tick this sender needs from each
- *           player) | u32 first_tick | count x (u16 buttons, s8 x, s8 y) |
+ *           player) | u32 first_tick | count x (u16 buttons, s8 x, s8 y[, s8 rx, s8 ry if type & 0x80]) |
  *           u32 stamp (sender clock, usecs) | u32 echo (newest stamp received
  *           from the destination) | u32 hold (usecs since that stamp arrived) |
  *           s32 advantage | u8 wished delay (auto delay; 0 = none) | u32 checksum
@@ -26,6 +26,9 @@ namespace {
 constexpr uint8_t kVersion = 2;
 constexpr uint32_t kRttRing = 90;  // round trips kept (auto delay uses their 90th percentile)
 constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3;
+// Input packets whose frames carry the right stick. Only used when a frame in the packet has a
+// non-zero right stick, so games without one send exactly the old format.
+constexpr uint8_t kTypeFlagRightStick = 0x80;
 constexpr uint32_t kRing = 1024;           // ticks of history kept per player
 constexpr uint32_t kMaxFramesPerPacket = 16;
 constexpr uint32_t kSyncRing = 64;
@@ -48,7 +51,8 @@ struct SyncEntry {
 };
 
 bool PadEq(const n64net_pad &a, const n64net_pad &b) {
-    return a.buttons == b.buttons && a.stick_x == b.stick_x && a.stick_y == b.stick_y;
+    return a.buttons == b.buttons && a.stick_x == b.stick_x && a.stick_y == b.stick_y && a.rstick_x == b.rstick_x &&
+           a.rstick_y == b.rstick_y;
 }
 
 uint64_t SteadyUsecs() {
@@ -212,7 +216,7 @@ struct n64net_input {
     void UpdateAutoDelay(uint64_t now);
     void SendInputs();
     void SendSync();
-    void HandleInput(Reader &r, uint8_t player, uint8_t count);
+    void HandleInput(Reader &r, uint8_t player, uint8_t count, bool right_stick);
     void HandleSync(Reader &r, uint8_t count);
     void CompareSync(const SyncEntry &a, const SyncEntry &b);
     static const SyncEntry *FindSync(const SyncEntry *ring, uint32_t count, uint32_t tick, uint8_t kind) {
@@ -251,9 +255,15 @@ void n64net_input::SendInputs() {
     if (local_started && first <= local_last) {
         count = std::min(kMaxFramesPerPacket, local_last - first + 1);
     }
+    bool right_stick = false;
+    for (uint32_t i = 0; i < count; i++) {
+        n64net_pad pad = {0, 0, 0, 0, 0};
+        LocalAt(first + i, &pad);
+        right_stick |= pad.rstick_x != 0 || pad.rstick_y != 0;
+    }
     w.U32(N64NET_INPUT_MAGIC);
     w.U8(kVersion);
-    w.U8(kTypeInput);
+    w.U8(kTypeInput | (right_stick ? kTypeFlagRightStick : 0));
     w.U8((uint8_t)cfg.local_player);
     w.U8((uint8_t)count);
     w.U32(cfg.session_id);
@@ -267,6 +277,10 @@ void n64net_input::SendInputs() {
         w.U16(pad.buttons);
         w.U8((uint8_t)pad.stick_x);
         w.U8((uint8_t)pad.stick_y);
+        if (right_stick) {
+            w.U8((uint8_t)pad.rstick_x);
+            w.U8((uint8_t)pad.rstick_y);
+        }
     }
     const uint64_t now = Now();
     w.U32((uint32_t)now);
@@ -314,7 +328,7 @@ void n64net_input::CompareSync(const SyncEntry &a, const SyncEntry &b) {
     }
 }
 
-void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count) {
+void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count, bool right_stick) {
     uint32_t acks[N64NET_INPUT_MAX_PLAYERS];
     for (uint32_t &a : acks) a = r.U32();
     const uint32_t first = r.U32();
@@ -323,6 +337,8 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count) {
         pads[i].buttons = r.U16();
         pads[i].stick_x = (int8_t)r.U8();
         pads[i].stick_y = (int8_t)r.U8();
+        pads[i].rstick_x = right_stick ? (int8_t)r.U8() : 0;
+        pads[i].rstick_y = right_stick ? (int8_t)r.U8() : 0;
     }
     const uint32_t stamp = r.U32();
     const uint32_t echo = r.U32();
@@ -513,9 +529,9 @@ int n64net_input_handle_packet(n64net_input *net, const uint8_t *data, uint32_t 
         return 1;
     }
     r.end = data + size - 4;
-    switch (type) {
+    switch (type & ~kTypeFlagRightStick) {
     case kTypeInput:
-        net->HandleInput(r, player, count);
+        net->HandleInput(r, player, count, (type & kTypeFlagRightStick) != 0);
         break;
     case kTypeSync:
         net->HandleSync(r, count);
