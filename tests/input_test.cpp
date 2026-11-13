@@ -254,6 +254,10 @@ int main() {
     rc |= Run("lockstep 50ms+20 jitter, auto delay", 0, 1, 2, 50, 20, 3000, false);
     rc |= Run("rollback 50ms+20 jitter, auto delay", 8, 1, 2, 50, 20, 3000, false);
     gAutoMax = 0;
+    // rollback with a long round trip: sender ahead of the peer's ack by more than one packet's frames
+    // (window 8 + delay 3 + ~10 ticks of ack latency); used to stall in bursts (MP2 on an iPhone)
+    rc |= Run("rollback 80ms+40 jitter 5% loss, delay 3", 8, 3, 5, 80, 40, 3000, false);
+    rc |= Run("rollback 120ms+40 jitter 5% loss, delay 3", 8, 3, 5, 120, 40, 3000, false);
     gLateStart = 20;
     rc |= Run("rollback, peer 1 starts 20 frames late (time sync)", 8, 2, 0, 20, 5, 3000, false);
     gLateStart = 0;

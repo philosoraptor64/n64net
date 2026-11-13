@@ -37,7 +37,7 @@ extern "C" {
 
 #define N64NET_INPUT_MAGIC 0x4E363449u /* 'N64I' */
 #define N64NET_INPUT_MAX_PLAYERS 4
-#define N64NET_INPUT_MAX_PACKET 192
+#define N64NET_INPUT_MAX_PACKET 320  /* 49 bytes of header/trailer + 32 frames of up to 8 bytes */
 
 typedef struct n64net_pad {
     uint16_t buttons;

@@ -31,7 +31,11 @@ constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3;
 // frame in the packet has one of them non-zero, so other games send exactly the old format.
 constexpr uint8_t kTypeFlagRightStick = 0x80;
 constexpr uint32_t kRing = 1024;           // ticks of history kept per player
-constexpr uint32_t kMaxFramesPerPacket = 16;
+// Frames per input packet, from the oldest tick the peer still needs (its ack) up to the newest.
+// With rollback a sender runs window + delay ticks ahead of what it has confirmed, and acks arrive
+// a round trip late; past this many frames the newest inputs wait for the acks to catch up, which
+// stalls both sides in bursts. 32 covers window 8 + delay 6 + a ~300 ms round trip.
+constexpr uint32_t kMaxFramesPerPacket = 32;
 constexpr uint32_t kSyncRing = 64;
 constexpr uint32_t kSyncPerPacket = 4;
 constexpr uint32_t kNoTick = UINT32_MAX;
