@@ -372,12 +372,14 @@ class Rendezvous(asyncio.DatagramProtocol):
         if want_relay and not room.relay:
             room.relay = True
             log.info("room %s relaying (after a move, asked by %s)", room.code, role)
-            self.send(room.host, f"RELAYOK {room.code}")
-            self.send(room.guest, f"RELAYOK {room.code}")
         if moved:
             self.send_peers(room)
         else:
             self.send(addr, f"MOVEOK {room.code}")
+        if room.relay:
+            # (again on every MOVE: a member that moved after the switch never got the first one)
+            self.send(room.host, f"RELAYOK {room.code}")
+            self.send(room.guest, f"RELAYOK {room.code}")
 
     def cmd_BYE(self, addr, args):
         room = self.by_addr.get(addr)
