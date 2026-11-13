@@ -45,6 +45,12 @@ typedef struct N64NetRendezvousResult {
      * "noroom" (the code was never hosted), "timeout", "cancelled", "full", "taken",
      * "game", "badcode", "busy", "resolve", "relay", "args". */
     char error[64];
+    /* This side's move token from the server (empty with an older server).
+     * After pairing, a side whose address changed (Wi-Fi <-> cellular) sends
+     * "N64R1 MOVE <room> <host|guest> <token> [relay]" to `server` from its
+     * socket: the server re-introduces both sides (PEER) or switches the room
+     * to relaying (RELAYOK to both). Also a keepalive, about once a minute. */
+    char token[24];
 } N64NetRendezvousResult;
 
 /* Blocks until connected, failed or timed out. Returns 0 on success.

@@ -184,6 +184,7 @@ class Session {
     std::string mInvitePass;
     std::string mLan;
     std::vector<sockaddr_in> mCandidates;
+    std::string mToken;   // PEER's 6th field: this side's move token
     sockaddr_in mPeer{};
     std::string mError;
 };
@@ -227,6 +228,9 @@ bool Session::WaitForPeer() {
             }
             mCandidates.clear();
             mCandidates.push_back(pub);
+            if (f.size() >= 6) {
+                mToken = f[5];
+            }
             if (Resolve(f[3], &lan) && !SameAddr(lan, pub) && lan.sin_addr.s_addr != 0) {
                 mCandidates.push_back(lan);
             }
@@ -401,6 +405,7 @@ int Session::Run(N64NetRendezvousResult *out) {
     out->relayed = relayed ? 1 : 0;
     out->is_host = mIsHost ? 1 : 0;
     std::snprintf(out->room, sizeof(out->room), "%s", mRoom.c_str());
+    std::snprintf(out->token, sizeof(out->token), "%s", mToken.c_str());
     return 0;
 }
 

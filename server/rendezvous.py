@@ -12,11 +12,21 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
     HOST <game> <code|-> <lan_ip:port>   claim a room (repeat ~1/s as keepalive)
     JOIN <game> <code> <lan_ip:port>     join a room (repeat until PEER)
     RELAY <code>                         switch this room to relaying
+    MOVE <code> <host|guest> <token> [relay]
+                                         a paired member's address changed (a phone
+                                         went from Wi-Fi to cellular): the token from
+                                         its PEER message proves it; the server re-
+                                         introduces both (PEER) and keeps relaying to
+                                         the new address. Also a keepalive (~1/min).
+                                         "relay": switch the room to relaying (both
+                                         members get RELAYOK).
     BYE <code>                           leave
     INVITE <code> <ttl_secs>             (password only) get an invite pass
   server -> client
     ROOM <code>                          room held for this host
-    PEER <code> <public_ip:port> <lan_ip:port> <host|guest>
+    PEER <code> <public_ip:port> <lan_ip:port> <host|guest> <token>
+                                         token: the RECIPIENT's own move token (MOVE)
+    MOVEOK <code>                        MOVE from an unchanged address (keepalive)
     RELAYOK <code>
     INVITE <code> <pass>                 a pass for that room (see below)
     ERR <reason>                         nosuchroom | full | taken | game | badcode | busy | auth
@@ -107,6 +117,8 @@ class Room:
         self.relay = False
         self.touched = time.monotonic()
         self.relayed_packets = 0
+        self.host_token = secrets.token_hex(8)
+        self.guest_token = None
 
     def other(self, addr):
         if addr == self.host:
@@ -155,8 +167,8 @@ class Rendezvous(asyncio.DatagramProtocol):
         return fmt_addr(member)
 
     def send_peers(self, room):
-        self.send(room.host, f"PEER {room.code} {self.visible_addr(room.guest, room.host)} {room.guest_lan} guest")
-        self.send(room.guest, f"PEER {room.code} {self.visible_addr(room.host, room.guest)} {room.host_lan} host")
+        self.send(room.host, f"PEER {room.code} {self.visible_addr(room.guest, room.host)} {room.guest_lan} guest {room.host_token}")
+        self.send(room.guest, f"PEER {room.code} {self.visible_addr(room.host, room.guest)} {room.host_lan} host {room.guest_token}")
 
     def datagram_received(self, data, addr):
         if len(data) > MAX_PACKET:
@@ -314,6 +326,7 @@ class Rendezvous(asyncio.DatagramProtocol):
                 return
         if room.guest is None or room.guest != addr:
             log.info("room %s joined by %s", code, fmt_addr(addr))
+            room.guest_token = secrets.token_hex(8)
         room.guest = addr
         room.guest_lan = lan
         room.touched = time.monotonic()
@@ -330,6 +343,41 @@ class Rendezvous(asyncio.DatagramProtocol):
         room.relay = True
         room.touched = time.monotonic()
         self.send(addr, f"RELAYOK {room.code}")
+
+    def cmd_MOVE(self, addr, args):
+        code, role, token = args[0].upper(), args[1], args[2]
+        want_relay = len(args) > 3 and args[3] == "relay"
+        room = self.rooms.get(code)
+        if room is None or room.guest is None:
+            self.send(addr, "ERR nosuchroom")
+            return
+        if role == "host" and hmac.compare_digest(token, room.host_token):
+            old = room.host
+        elif role == "guest" and room.guest_token and hmac.compare_digest(token, room.guest_token):
+            old = room.guest
+        else:
+            self.send(addr, "ERR auth")
+            return
+        room.touched = time.monotonic()
+        moved = old != addr
+        if moved:
+            if self.by_addr.get(old) is room:
+                del self.by_addr[old]
+            if role == "host":
+                room.host = addr
+            else:
+                room.guest = addr
+            self.by_addr[addr] = room
+            log.info("room %s: %s moved %s -> %s", room.code, role, fmt_addr(old), fmt_addr(addr))
+        if want_relay and not room.relay:
+            room.relay = True
+            log.info("room %s relaying (after a move, asked by %s)", room.code, role)
+            self.send(room.host, f"RELAYOK {room.code}")
+            self.send(room.guest, f"RELAYOK {room.code}")
+        if moved:
+            self.send_peers(room)
+        else:
+            self.send(addr, f"MOVEOK {room.code}")
 
     def cmd_BYE(self, addr, args):
         room = self.by_addr.get(addr)
