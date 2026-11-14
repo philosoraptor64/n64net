@@ -3,7 +3,8 @@
  * Game-neutral C API (client/src/n64net_input.cpp).
  *
  * Model. A tick is one step of the game's simulation that reads controllers
- * once. Every machine owns one player; its controller sample taken at tick t
+ * once. Every machine owns one or more players (local_mask: up to 4 controllers
+ * on one device); each local controller sample taken at tick t
  * is applied by every machine at tick t + input_delay. Remote inputs that
  * haven't arrived are predicted (the last confirmed input repeats). When a
  * remote input arrives for a tick that was already simulated with a wrong
@@ -37,7 +38,9 @@ extern "C" {
 
 #define N64NET_INPUT_MAGIC 0x4E363449u /* 'N64I' */
 #define N64NET_INPUT_MAX_PLAYERS 4
-#define N64NET_INPUT_MAX_PACKET 320  /* 49 bytes of header/trailer + 32 frames of up to 8 bytes */
+#define N64NET_INPUT_MAX_PACKET 1024 /* header/trailer + frames (events make frames bigger: the
+                                         sender packs as many as fit) */
+#define N64NET_INPUT_MAX_EVENT 16    /* bytes of one tick's event (n64net_input_set_event) */
 
 typedef struct n64net_pad {
     uint16_t buttons;
@@ -55,8 +58,8 @@ typedef struct n64net_input n64net_input;
 
 typedef struct n64net_input_config {
     int num_players;           /* 2..N64NET_INPUT_MAX_PLAYERS, players 0..n-1 */
-    int local_player;          /* the player this machine controls */
-    uint32_t remote_mask;      /* players driven by other machines (bit p); 0 = all but local_player.
+    int local_player;          /* the player this machine controls (with local_mask: its first one) */
+    uint32_t remote_mask;      /* players driven by other machines (bit p); 0 = all not local.
                                   Players in neither (CPUs, empty slots) read as neutral input */
     uint32_t session_id;       /* equal on both machines; packets from other sessions are ignored */
     uint32_t start_tick;       /* first tick of the match (inputs before it are never needed) */
@@ -67,6 +70,10 @@ typedef struct n64net_input_config {
     void *user;
     void (*log)(const char *fmt, ...);  /* optional */
     uint64_t (*now_usecs)(void);        /* optional monotonic clock (tests); default steady clock */
+    uint32_t local_mask;       /* players this machine controls (bit p); 0 = just local_player.
+                                  Must include local_player. Each local player's inputs travel in
+                                  their own packets (the same format), so other machines need no
+                                  notice of how players are spread over devices beyond remote_mask. */
 } n64net_input_config;
 
 n64net_input *n64net_input_create(const n64net_input_config *config);
@@ -79,6 +86,28 @@ void n64net_input_destroy(n64net_input *net);
  * delay of 0, lockstep needs each side to sample before waiting. Sends an
  * input packet. */
 void n64net_input_set_local(n64net_input *net, uint32_t tick, n64net_pad pad);
+
+/* Several local controllers (local_mask): pads[p] for every local player p (others ignored),
+ * otherwise as n64net_input_set_local. n64net_input_set_local sets the first local player's pad
+ * and leaves the other local players neutral. */
+void n64net_input_set_local_pads(n64net_input *net, uint32_t tick, const n64net_pad pads[N64NET_INPUT_MAX_PLAYERS]);
+
+/* --- Events -----------------------------------------------------------------
+ * Up to N64NET_INPUT_MAX_EVENT bytes attached to this machine's next scheduled
+ * tick (the tick the next set_local call schedules: its sample tick + delay),
+ * in its first local player's stream. Every machine reads it when it plays that
+ * tick, so a decision made on one machine (the host: "a CPU takes over player 3")
+ * applies at the same tick everywhere and is replayed by rollback like an input.
+ * Events are never predicted: a confirmed event for a tick already simulated
+ * triggers a rollback to it. Returns 1, or 0 if an event is already waiting for
+ * the next tick or size is 0 or too big. */
+int n64net_input_set_event(n64net_input *net, const void *data, uint32_t size);
+
+/* The event `player`'s machine attached to `tick` (player: that machine's first
+ * local player; events of other players are always empty). Returns its size, 0
+ * if none (or not received yet: then it counts as "none" for that tick until the
+ * input arrives, like a prediction). Call after n64net_input_get for the tick. */
+uint32_t n64net_input_get_event(n64net_input *net, int player, uint32_t tick, void *out, uint32_t cap);
 
 /* 1 if `tick` may be simulated now: every remote player's inputs are confirmed
  * up to at least tick - rollback_window (lockstep: up to tick). */
