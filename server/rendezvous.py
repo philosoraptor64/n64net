@@ -22,6 +22,8 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
                                          members get RELAYOK).
     BYE <code>                           leave
     INVITE <code> <ttl_secs>             (password only) get an invite pass
+    HOSTN <game> <code|-> <lan_ip:port>  like HOST, for a room of up to 4 machines (below)
+    JOINN <game> <code> <lan_ip:port>    like JOIN, into such a room
   server -> client
     ROOM <code>                          room held for this host
     PEER <code> <public_ip:port> <lan_ip:port> <host|guest> <token>
@@ -31,6 +33,18 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
     INVITE <code> <pass>                 a pass for that room (see below)
     ERR <reason>                         nosuchroom | full | taken | game | badcode | busy | auth
     ERR version <host_build>             same game, different build (see below)
+    MEMBER <code> <index> <public_ip:port> <lan_ip:port> <your_index> <your_token>
+                                         (rooms for up to 4) one other member; index 0 = host
+    LEFT <code> <index>                  (rooms for up to 4) that member left (BYE or idle)
+
+Rooms for up to 4 machines (HOSTN): the host is member 0, each JOINN takes the
+lowest free index 1-3. On every join the server introduces every pair: each
+member gets a MEMBER message for every other member (repeated with the host's
+keepalive, so a lost one is resent), and they hole-punch pairwise. MOVE finds
+the member by its token (any role word). In a relaying room the server forwards
+each non-control datagram to EVERY other member (clients receive their peers'
+broadcasts as usual). An old client may JOIN such a room while only the host is
+in it; it then gets PEER as in a two-player room, and the room takes no one else.
 
 <game> may end in "+<build>": players of the same game with different builds
 cannot stay in sync, so JOIN is refused with "ERR version" (naming the host's
@@ -78,8 +92,8 @@ ROOM_IDLE_SECS = 600        # forget rooms idle this long
 RELAY_IDLE_SECS = 120       # forget a relaying room with no traffic this long
 MAX_ROOMS = 5000
 MAX_PACKET = 1500
-AUTH_FIELDS = {"HOST": 3, "JOIN": 3, "RELAY": 1, "BYE": 1, "INVITE": 2}  # fields before <time> <mac>
-PASS_COMMANDS = {"JOIN": 1, "RELAY": 0, "BYE": 0}  # may use an invite pass; index of <code>
+AUTH_FIELDS = {"HOST": 3, "JOIN": 3, "RELAY": 1, "BYE": 1, "INVITE": 2, "HOSTN": 3, "JOINN": 3}  # before <time> <mac>
+PASS_COMMANDS = {"JOIN": 1, "RELAY": 0, "BYE": 0, "JOINN": 1}  # may use an invite pass; index of <code>
 INVITE_MAX_TTL = 7 * 24 * 3600
 AUTH_WINDOW_SECS = 300      # allowed clock difference
 AUTH_MAX_FAILURES = 10      # per address within AUTH_BAN_SECS ...
@@ -106,8 +120,18 @@ def valid_code(code):
     return len(code) == CODE_LEN and code.isascii() and code.isalnum()
 
 
+MAX_MEMBERS = 4
+
+
+class Member:
+    def __init__(self, addr, lan):
+        self.addr = addr
+        self.lan = lan
+        self.token = secrets.token_hex(8)
+
+
 class Room:
-    def __init__(self, code, game, host_addr, host_lan):
+    def __init__(self, code, game, host_addr, host_lan, multi=False):
         self.code = code
         self.game = game
         self.host = host_addr
@@ -119,6 +143,13 @@ class Room:
         self.relayed_packets = 0
         self.host_token = secrets.token_hex(8)
         self.guest_token = None
+        # rooms for up to 4 (HOSTN): members[index]; index 0 = the host. `legacy`: an old client joined
+        # with JOIN, so the room is a two-player room from then on.
+        self.multi = multi
+        self.legacy = False
+        self.members = [Member(host_addr, host_lan)] + [None] * (MAX_MEMBERS - 1) if multi else None
+        if multi:
+            self.members[0].token = self.host_token
 
     def other(self, addr):
         if addr == self.host:
@@ -126,6 +157,25 @@ class Room:
         if addr == self.guest:
             return self.host
         return None
+
+    def index_of(self, addr):
+        if self.members:
+            for i, m in enumerate(self.members):
+                if m is not None and m.addr == addr:
+                    return i
+        return None
+
+    def others(self, addr):
+        """Every other member's address (relaying)."""
+        if self.multi and not self.legacy:
+            return [m.addr for m in self.members if m is not None and m.addr != addr]
+        o = self.other(addr)
+        return [o] if o is not None else []
+
+    def addresses(self):
+        if self.multi and not self.legacy:
+            return [m.addr for m in self.members if m is not None]
+        return [a for a in (self.host, self.guest) if a is not None]
 
 
 class Rendezvous(asyncio.DatagramProtocol):
@@ -156,9 +206,29 @@ class Rendezvous(asyncio.DatagramProtocol):
     def drop_room(self, room, why):
         log.info("room %s closed (%s, relayed=%d)", room.code, why, room.relayed_packets)
         self.rooms.pop(room.code, None)
-        for a in (room.host, room.guest):
+        for a in room.addresses() + [room.host, room.guest]:
             if a is not None and self.by_addr.get(a) is room:
                 del self.by_addr[a]
+
+    def send_members(self, room):
+        """Rooms for up to 4: every member learns every other member."""
+        ms = [(i, m) for i, m in enumerate(room.members) if m is not None]
+        for i, m in ms:
+            for j, o in ms:
+                if j != i:
+                    self.send(m.addr, f"MEMBER {room.code} {j} {self.visible_addr(o.addr, m.addr)} {o.lan} {i} {m.token}")
+
+    def drop_member(self, room, index, why):
+        m = room.members[index]
+        if m is None:
+            return
+        log.info("room %s: member %d left (%s)", room.code, index, why)
+        room.members[index] = None
+        if self.by_addr.get(m.addr) is room:
+            del self.by_addr[m.addr]
+        for o in room.members:
+            if o is not None:
+                self.send(o.addr, f"LEFT {room.code} {index}")
 
     def visible_addr(self, member, viewer):
         """`member`'s address as `viewer` should dial it."""
@@ -176,11 +246,12 @@ class Rendezvous(asyncio.DatagramProtocol):
         if not data.startswith(PREFIX):
             room = self.by_addr.get(addr)
             if room is not None and room.relay:
-                dest = room.other(addr)
-                if dest is not None:
+                dests = room.others(addr)
+                if dests:
                     room.touched = time.monotonic()
                     room.relayed_packets += 1
-                    self.transport.sendto(data, dest)
+                    for dest in dests:
+                        self.transport.sendto(data, dest)
             return
         try:
             parts = data[len(PREFIX):].decode("ascii").split()
@@ -263,13 +334,19 @@ class Rendezvous(asyncio.DatagramProtocol):
         log.info("invite pass for room %s (%d s) to %s", code, ttl, fmt_addr(addr))
         self.send(addr, f"INVITE {code} {expiry}-{self.invite_mac(code, expiry)}")
 
-    def cmd_HOST(self, addr, args):
+    def cmd_HOSTN(self, addr, args):
+        self.cmd_HOST(addr, args, multi=True)
+
+    def cmd_HOST(self, addr, args, multi=False):
         game, code, lan = args[0], args[1].upper(), args[2]
         room = self.by_addr.get(addr)
         if room is not None and room.host == addr and (code == "-" or code == room.code):
             room.touched = time.monotonic()  # keepalive
             self.send(addr, f"ROOM {room.code}")
-            if room.guest is not None:
+            if room.multi and not room.legacy:
+                if sum(m is not None for m in room.members) > 1:
+                    self.send_members(room)
+            elif room.guest is not None:
                 self.send_peers(room)
             return
         if code == "-":
@@ -296,13 +373,33 @@ class Rendezvous(asyncio.DatagramProtocol):
             return
         if room is not None:
             self.drop_room(room, "host moved")
-        room = Room(code, game, addr, lan)
+        room = Room(code, game, addr, lan, multi)
         self.rooms[code] = room
         self.by_addr[addr] = room
-        log.info("room %s opened by %s game=%s", code, fmt_addr(addr), game)
+        log.info("room %s opened by %s game=%s%s", code, fmt_addr(addr), game, " (up to 4)" if multi else "")
         self.send(addr, f"ROOM {code}")
 
-    def cmd_JOIN(self, addr, args):
+    def cmd_JOINN(self, addr, args):
+        self.cmd_JOIN(addr, args, multi=True)
+
+    def join_multi(self, room, addr, lan):
+        """JOINN into a room for up to 4: the lowest free index (or the member's own, when repeated)."""
+        idx = room.index_of(addr)
+        if idx is None:
+            free = [i for i in range(1, MAX_MEMBERS) if room.members[i] is None]
+            if not free:
+                self.send(addr, "ERR full")
+                return
+            idx = free[0]
+            room.members[idx] = Member(addr, lan)
+            log.info("room %s joined by %s as member %d", room.code, fmt_addr(addr), idx)
+        else:
+            room.members[idx].lan = lan
+        room.touched = time.monotonic()
+        self.by_addr[addr] = room
+        self.send_members(room)
+
+    def cmd_JOIN(self, addr, args, multi=False):
         game, code, lan = args[0], args[1].upper(), args[2]
         room = self.rooms.get(code)
         if room is None:
@@ -315,6 +412,18 @@ class Rendezvous(asyncio.DatagramProtocol):
             else:
                 self.send(addr, "ERR game")
             return
+        if room.multi and room.legacy and multi and room.guest is not None and room.guest != addr:
+            self.send(addr, "ERR full")   # an old client made it a two-player room
+            return
+        if room.multi and not room.legacy:
+            if multi:
+                self.join_multi(room, addr, lan)
+                return
+            # an old client: only into a room with just its host; the room is two-player from now on
+            if any(m is not None for m in room.members[1:]):
+                self.send(addr, "ERR full")
+                return
+            room.legacy = True
         if room.guest is not None and room.guest != addr:
             if room.guest[0] == addr[0]:
                 # The same guest restarted (new port): replace the old one and
@@ -335,6 +444,14 @@ class Rendezvous(asyncio.DatagramProtocol):
 
     def cmd_RELAY(self, addr, args):
         room = self.by_addr.get(addr)
+        if room is not None and room.multi and not room.legacy and room.code == args[0].upper():
+            if not room.relay:
+                log.info("room %s relaying for every member (asked by %s)", room.code, fmt_addr(addr))
+            room.relay = True
+            room.touched = time.monotonic()
+            for a in room.addresses():
+                self.send(a, f"RELAYOK {room.code}")
+            return
         if room is None or room.code != args[0].upper() or room.guest is None:
             self.send(addr, "ERR nosuchroom")
             return
@@ -348,6 +465,9 @@ class Rendezvous(asyncio.DatagramProtocol):
         code, role, token = args[0].upper(), args[1], args[2]
         want_relay = len(args) > 3 and args[3] == "relay"
         room = self.rooms.get(code)
+        if room is not None and room.multi and not room.legacy:
+            self.move_multi(room, addr, token, want_relay)
+            return
         if room is None or room.guest is None:
             self.send(addr, "ERR nosuchroom")
             return
@@ -381,9 +501,45 @@ class Rendezvous(asyncio.DatagramProtocol):
             self.send(room.host, f"RELAYOK {room.code}")
             self.send(room.guest, f"RELAYOK {room.code}")
 
+    def move_multi(self, room, addr, token, want_relay):
+        idx = None
+        for i, m in enumerate(room.members):
+            if m is not None and hmac.compare_digest(token, m.token):
+                idx = i
+                break
+        if idx is None:
+            self.send(addr, "ERR auth")
+            return
+        m = room.members[idx]
+        room.touched = time.monotonic()
+        moved = m.addr != addr
+        if moved:
+            if self.by_addr.get(m.addr) is room:
+                del self.by_addr[m.addr]
+            log.info("room %s: member %d moved %s -> %s", room.code, idx, fmt_addr(m.addr), fmt_addr(addr))
+            m.addr = addr
+            if idx == 0:
+                room.host = addr
+            self.by_addr[addr] = room
+        if want_relay and not room.relay:
+            room.relay = True
+            log.info("room %s relaying for every member (after a move of member %d)", room.code, idx)
+        if moved:
+            self.send_members(room)
+        else:
+            self.send(addr, f"MOVEOK {room.code}")
+        if room.relay:
+            for a in room.addresses():
+                self.send(a, f"RELAYOK {room.code}")
+
     def cmd_BYE(self, addr, args):
         room = self.by_addr.get(addr)
         if room is not None and room.code == args[0].upper():
+            if room.multi and not room.legacy:
+                idx = room.index_of(addr)
+                if idx not in (None, 0):
+                    self.drop_member(room, idx, "bye")
+                    return
             self.drop_room(room, "bye")
 
     def expire(self):
