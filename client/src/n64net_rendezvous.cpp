@@ -234,6 +234,8 @@ bool Session::WaitForPeer() {
             if (f.size() >= 6) {
                 mToken = f[5];
             }
+            mMemberIndex = mIsHost ? 0 : 1;   /* a two-player room: host 0, guest 1 */
+            mPeerIndex = mIsHost ? 1 : 0;
             if (Resolve(f[3], &lan) && !SameAddr(lan, pub) && lan.sin_addr.s_addr != 0) {
                 mCandidates.push_back(lan);
             }
