@@ -103,7 +103,7 @@ void Load(void *user, uint32_t slot) {
 void Advance(void *user) { Step(*(Machine *)user); }
 
 bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window, uint32_t delay, Net net,
-         uint32_t event_at) {
+         uint32_t event_at, int bad_machine = -1) {
     g_now = 0;
     g_rng = 12345;
     g_wire.clear();
@@ -209,6 +209,22 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
         uint8_t ev[N64NET_INPUT_MAX_EVENT];
         if (n64net_input_get_event(g_m[i].net, 0, event_at + delay, ev, sizeof(ev)) == 3 && ev[2] == 3) seen++;
     }
+    // sync checks every 60 confirmed ticks: every machine must see a wrong hash from any other machine
+    // (bad_machine reports wrong ones), and none may see a desync when all agree
+    for (uint32_t t = 60; t <= confirmed; t += 60) {
+        for (int i = 0; i < machines; i++) {
+            const uint32_t h = (uint32_t)g_m[i].hist[t] ^ (i == bad_machine ? 0x5A5Au : 0u);
+            n64net_sync_record(g_m[i].net, t, 1, h);
+        }
+        for (auto &pk : g_wire) n64net_input_handle_packet(g_m[pk.to].net, pk.data.data(), (uint32_t)pk.data.size());
+        g_wire.clear();
+    }
+    int detected = 0;
+    for (int i = 0; i < machines; i++) detected += n64net_sync_desynced(g_m[i].net, nullptr, nullptr);
+    const bool sync_ok = bad_machine < 0 ? detected == 0 : detected == machines;
+    if (!sync_ok) printf("%s: sync check: %d of %d machines saw a desync (expected %d)\n", name, detected, machines,
+                         bad_machine < 0 ? 0 : machines);
+    ok = ok && sync_ok;
     uint32_t rb = 0;
     n64net_input_stats st;
     for (int i = 0; i < machines; i++) { n64net_input_get_stats(g_m[i].net, &st); rb += st.rollbacks; }
@@ -233,6 +249,8 @@ int main() {
     all &= Run("3 machines (one with 2 players), rollback", three_2local, 3, 8, 2, bad, 500);
     all &= Run("4 machines, rollback, cellular", four, 4, 8, 3, cell, 700);
     all &= Run("3 players on one machine + 1, rollback", one_device_two_machines, 2, 8, 2, bad, 400);
+    all &= Run("4 machines, the last one desyncs (all must notice)", four, 4, 8, 2, bad, 300, 3);
+    all &= Run("3 machines, the middle one desyncs", three_2local, 3, 8, 2, bad, 300, 1);
     printf("%s\n", all ? "ALL PASS" : "SOME FAILED");
     return all ? 0 : 1;
 }

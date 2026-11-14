@@ -151,9 +151,11 @@ struct n64net_input {
 
     // Sync checks.
     SyncEntry local_sync[kSyncRing];
-    SyncEntry remote_sync[kSyncRing];  // in arrival order
+    // per sending machine (indexed by its first player), in arrival order: with 3-4 machines every
+    // peer's hash for a tick is compared with ours, not only the first to arrive
+    SyncEntry remote_sync[N64NET_INPUT_MAX_PLAYERS][kSyncRing];
     uint32_t local_sync_count = 0;
-    uint32_t remote_sync_count = 0;
+    uint32_t remote_sync_count[N64NET_INPUT_MAX_PLAYERS] = {};
     bool desynced = false;
     uint32_t desync_tick = 0;
     uint8_t desync_kind = 0;
@@ -262,7 +264,7 @@ struct n64net_input {
     void SendInputsFor(int p);
     void SendSync();
     void HandleInput(Reader &r, uint8_t player, uint8_t count, bool right_stick, bool events);
-    void HandleSync(Reader &r, uint8_t count);
+    void HandleSync(Reader &r, uint8_t player, uint8_t count);
     void CompareSync(const SyncEntry &a, const SyncEntry &b);
     static const SyncEntry *FindSync(const SyncEntry *ring, uint32_t count, uint32_t tick, uint8_t kind) {
         for (uint32_t j = 0; j < std::min(count, kSyncRing); j++) {
@@ -489,7 +491,7 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count, bool ri
     }
 }
 
-void n64net_input::HandleSync(Reader &r, uint8_t count) {
+void n64net_input::HandleSync(Reader &r, uint8_t player, uint8_t count) {
     SyncEntry got[kSyncPerPacket];
     if (count > kSyncPerPacket) {
         stats.packets_dropped++;
@@ -507,8 +509,10 @@ void n64net_input::HandleSync(Reader &r, uint8_t count) {
     stats.packets_received++;
     last_recv_usecs = Now();
     for (uint32_t i = 0; i < count; i++) {
-        if (FindSync(remote_sync, remote_sync_count, got[i].tick, got[i].kind)) continue;  // seen (repeats)
-        remote_sync[remote_sync_count++ % kSyncRing] = got[i];
+        SyncEntry *ring = remote_sync[player];
+        uint32_t &n = remote_sync_count[player];
+        if (FindSync(ring, n, got[i].tick, got[i].kind)) continue;  // seen (repeats)
+        ring[n++ % kSyncRing] = got[i];
         if (const SyncEntry *mine = FindSync(local_sync, local_sync_count, got[i].tick, got[i].kind)) {
             CompareSync(*mine, got[i]);
         }
@@ -672,7 +676,7 @@ int n64net_input_handle_packet(n64net_input *net, const uint8_t *data, uint32_t 
         net->HandleInput(r, player, count, (type & kTypeFlagRightStick) != 0, (type & kTypeFlagEvents) != 0);
         break;
     case kTypeSync:
-        net->HandleSync(r, count);
+        net->HandleSync(r, player, count);
         break;
     case kTypeAway:
     case kTypeBack:
@@ -761,8 +765,10 @@ void n64net_sync_record(n64net_input *net, uint32_t tick, uint8_t kind, uint32_t
     e.hash = hash;
     net->local_sync[net->local_sync_count % kSyncRing] = e;
     net->local_sync_count++;
-    if (const SyncEntry *theirs = n64net_input::FindSync(net->remote_sync, net->remote_sync_count, tick, kind)) {
-        net->CompareSync(e, *theirs);
+    for (int q = 0; q < N64NET_INPUT_MAX_PLAYERS; q++) {
+        if (const SyncEntry *theirs = n64net_input::FindSync(net->remote_sync[q], net->remote_sync_count[q], tick, kind)) {
+            net->CompareSync(e, *theirs);
+        }
     }
     net->SendSync();
 }
