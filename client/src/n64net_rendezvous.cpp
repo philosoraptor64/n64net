@@ -125,10 +125,12 @@ class Session {
         Send(mServer, signed_msg + " " + n64net::HmacSha256Hex(mPassword, signed_msg).substr(0, 32));
     }
     void Register() {
+        const bool multi = mCfg.max_members > 2;
         if (mIsHost) {
-            SendToServer("HOST " + std::string(mCfg.game) + " " + (mRoom.empty() ? "-" : mRoom) + " " + mLan);
+            SendToServer(std::string(multi ? "HOSTN " : "HOST ") + mCfg.game + " " + (mRoom.empty() ? "-" : mRoom) + " " +
+                         mLan);
         } else {
-            SendToServer("JOIN " + std::string(mCfg.game) + " " + mRoom + " " + mLan);
+            SendToServer(std::string(multi ? "JOINN " : "JOIN ") + mCfg.game + " " + mRoom + " " + mLan);
         }
     }
     // Waits up to `ms` for one datagram. Returns its size, 0 if none, -1 on error.
@@ -185,6 +187,7 @@ class Session {
     std::string mLan;
     std::vector<sockaddr_in> mCandidates;
     std::string mToken;   // PEER's 6th field: this side's move token
+    int mMemberIndex = 0, mPeerIndex = 0;
     sockaddr_in mPeer{};
     std::string mError;
 };
@@ -236,6 +239,21 @@ bool Session::WaitForPeer() {
             }
             mLog("n64net: room %s paired with %s (public %s, lan %s)\n", f[1].c_str(), f[4].c_str(), f[2].c_str(),
                  f[3].c_str());
+            return true;
+        } else if (f[0] == "MEMBER" && f.size() >= 7) {
+            // a room for up to 4: a guest pairs with the host (member 0) first, the host with any guest
+            const int idx = atoi(f[2].c_str());
+            if (!mIsHost && idx != 0) continue;
+            sockaddr_in pub{}, lan{};
+            if (!Resolve(f[3], &pub)) continue;
+            mCandidates.clear();
+            mCandidates.push_back(pub);
+            if (Resolve(f[4], &lan) && !SameAddr(lan, pub) && lan.sin_addr.s_addr != 0) mCandidates.push_back(lan);
+            mMemberIndex = atoi(f[5].c_str());
+            mPeerIndex = idx;
+            mToken = f[6];
+            mLog("n64net: room %s: member %d meets member %d (public %s, lan %s)\n", f[1].c_str(), mMemberIndex, idx,
+                 f[3].c_str(), f[4].c_str());
             return true;
         } else if (f[0] == "ERR" && f.size() >= 2) {
             if (f[1] == "nosuchroom" && !mIsHost) {
@@ -406,6 +424,8 @@ int Session::Run(N64NetRendezvousResult *out) {
     out->is_host = mIsHost ? 1 : 0;
     std::snprintf(out->room, sizeof(out->room), "%s", mRoom.c_str());
     std::snprintf(out->token, sizeof(out->token), "%s", mToken.c_str());
+    out->member_index = mMemberIndex;
+    out->peer_index = mPeerIndex;
     return 0;
 }
 
@@ -454,6 +474,33 @@ extern "C" void n64net_rendezvous_bye(int, const N64NetRendezvousConfig *) {
 }
 
 #endif
+
+extern "C" int n64net_rendezvous_parse_member(const void *data, int size, char room_out[8], int *index,
+                                              struct sockaddr_in *pub, struct sockaddr_in *lan, int *my_index,
+                                              char *token_out, int token_cap) {
+    if (size <= 6 || size > 400 || std::memcmp(data, "N64R1 ", 6) != 0) return 0;
+    std::string text((const char *)data + 6, (size_t)size - 6);
+    std::vector<std::string> f;
+    for (size_t i = 0; i < text.size();) {
+        size_t j = text.find(' ', i);
+        if (j == std::string::npos) j = text.size();
+        if (j > i) f.push_back(text.substr(i, j - i));
+        i = j + 1;
+    }
+    if (f.size() >= 3 && f[0] == "LEFT") {
+        std::snprintf(room_out, 8, "%s", f[1].c_str());
+        if (index) *index = atoi(f[2].c_str());
+        return 2;
+    }
+    if (f.size() < 7 || f[0] != "MEMBER") return 0;
+    std::snprintf(room_out, 8, "%s", f[1].c_str());
+    if (index) *index = atoi(f[2].c_str());
+    if (pub && !Resolve(f[3], pub)) return 0;
+    if (lan && !Resolve(f[4], lan)) std::memset(lan, 0, sizeof(*lan));
+    if (my_index) *my_index = atoi(f[5].c_str());
+    if (token_out && token_cap > 0) std::snprintf(token_out, (size_t)token_cap, "%s", f[6].c_str());
+    return 1;
+}
 
 extern "C" int n64net_rendezvous_request_invite(int sock, const N64NetRendezvousConfig *config, int ttl_secs) {
     sockaddr_in server{};

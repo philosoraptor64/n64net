@@ -29,6 +29,11 @@ typedef struct N64NetRendezvousConfig {
     /* Optional: set *cancel to non-zero (from any thread) to stop waiting for
      * the other player; connect then fails with error "cancelled". */
     const volatile int *cancel;
+    /* Optional: machines in the room, 2-4 (0 = 2: a two-player room as before). Above 2 the host opens a
+     * room for up to 4 (HOSTN) and guests join with JOINN; connect returns once paired with ONE other
+     * member (a guest: the host; the host: its first guest). Members joining later arrive as MEMBER
+     * datagrams on the socket during the session: n64net_rendezvous_parse_member. */
+    int max_members;
 } N64NetRendezvousConfig;
 
 typedef struct N64NetRendezvousResult {
@@ -51,7 +56,18 @@ typedef struct N64NetRendezvousResult {
      * socket: the server re-introduces both sides (PEER) or switches the room
      * to relaying (RELAYOK to both). Also a keepalive, about once a minute. */
     char token[24];
+    /* Rooms for up to 4: this machine's member index (0 = host) and the paired member's. */
+    int member_index;
+    int peer_index;
 } N64NetRendezvousResult;
+
+/* Rooms for up to 4. A datagram from the server: "MEMBER": another member (fills its index, public and
+ * LAN address, this machine's index and move token; returns 1) / "LEFT": a member left (index; returns
+ * 2). Else 0. The game channel hole-punches a new member by sending to both addresses (the server has
+ * told that member about us too) and treats whichever answers as its path. */
+int n64net_rendezvous_parse_member(const void *data, int size, char room_out[8], int *index,
+                                   struct sockaddr_in *pub, struct sockaddr_in *lan, int *my_index,
+                                   char *token_out, int token_cap);
 
 /* Blocks until connected, failed or timed out. Returns 0 on success.
  * `sock` must be a bound, non-blocking IPv4 UDP socket. */
