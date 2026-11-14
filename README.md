@@ -104,3 +104,8 @@ first existing of `SDL2::SDL2-static`, `SDL2::SDL2`, `SDL2-static`, `SDL2`).
 
 ## License
 MIT (see `LICENSE`). Opus is BSD-licensed and fetched at build time.
+
+## Adding a game
+
+The standard process from a fresh ROM to a full i64 game (stages, gates and the per-game scorecard):
+[docs/new-game-process.md](docs/new-game-process.md).
