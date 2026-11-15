@@ -198,6 +198,7 @@ struct n64net_input {
     uint32_t admit_have = 0;        // log ticks it has (from start_tick: the next it needs)
     uint32_t admit_sent = 0;        // next log tick to send
     uint64_t admit_progress_at = 0; // when admit_have last grew
+    bool admit_heard = false;       // its game runs (a "have" arrived): until then one piece now and then
     void ServeJoiner();
     void SendLog(uint32_t first, uint32_t *next);
     // the joiner
@@ -933,6 +934,14 @@ void n64net_input::ServeJoiner() {
         admit_sent = admit_have;
         admit_progress_at = now;
     }
+    if (!admit_heard) {   // the joiner's game is still starting: no flood it would drop
+        if (now - admit_progress_at > 200000 && admit_have < log_end) {
+            uint32_t next = 0;
+            SendLog(admit_have, &next);
+            admit_progress_at = now;
+        }
+        return;
+    }
     for (uint32_t k = 0; k < kLogPacketsPerSend && admit_sent < log_end; k++) SendLog(admit_sent, &admit_sent);
     if (rejoin_tick == kNoTick && log_end - std::min(admit_have, log_end) <= kJoinNear) {
         uint32_t live = std::max(highest_got, last_sample_tick + 1);
@@ -1221,9 +1230,13 @@ int n64net_input_handle_packet(n64net_input *net, const uint8_t *data, uint32_t 
     case kTypeHave: {
         const uint32_t have = r.U32();
         if (!r.ok) break;
-        if (net->admit_mask && player == (uint8_t)__builtin_ctz(net->admit_mask) && have > net->admit_have) {
-            net->admit_have = have;
-            net->admit_progress_at = net->Now();
+        if (net->admit_mask && player == (uint8_t)__builtin_ctz(net->admit_mask)) {
+            if (!net->admit_heard) net->Log("n64net input: the joiner's game is up (it has %u ticks of the log)\n", have);
+            net->admit_heard = true;
+            if (have > net->admit_have) {
+                net->admit_have = have;
+                net->admit_progress_at = net->Now();
+            }
         }
         break;
     }
@@ -1458,6 +1471,7 @@ int n64net_input_admit(n64net_input *net, uint32_t player_mask) {
     net->admit_mask = player_mask;
     net->admit_have = net->admit_sent = net->cfg.start_tick;
     net->admit_progress_at = net->Now();
+    net->admit_heard = false;
     net->rejoin_tick = kNoTick;
     net->Log("n64net input: a machine joins as players %x: sending it the log (%u ticks so far)\n", player_mask,
              net->log_end - net->cfg.start_tick);
