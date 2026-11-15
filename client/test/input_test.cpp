@@ -56,8 +56,10 @@ Machine g_m[kMaxMachines];
 int g_machines = 0;
 int g_players = 0;
 
+int g_silent = -1;   // a machine that left: nothing it sends arrives
 void SendFrom(void *user, const uint8_t *data, uint32_t size) {
     const int from = (int)(intptr_t)user;
+    if (from == g_silent) return;
     for (int to = 0; to < g_machines; to++) {
         if (to == from || Rand() % 100 < g_net.loss_pct) continue;
         const uint64_t at = g_now + g_net.latency_us + (g_net.jitter_us ? Rand() % g_net.jitter_us : 0);
@@ -88,6 +90,11 @@ void Step(Machine &m) {
         if (n) {
             for (uint32_t k = 0; k < n; k++) m.state = Mix(m.state, ev[k] + 1000u * p);
         }
+        // a player who left: from the agreed tick the game "changes" it (a CPU takes over)
+        uint32_t last, apply, alen = sizeof(ev);
+        if (n64net_input_retired(m.net, p, &last, &apply, ev, &alen) && m.tick >= apply) {
+            m.state = Mix(m.state, 77000u + ev[0] + 10u * p);
+        }
     }
     m.hist[m.tick] = m.state;
     m.tick++;
@@ -103,9 +110,13 @@ void Load(void *user, uint32_t slot) {
 void Advance(void *user) { Step(*(Machine *)user); }
 
 bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window, uint32_t delay, Net net,
-         uint32_t event_at, int bad_machine = -1) {
+         uint32_t event_at, int bad_machine = -1, int leaver = -1, uint32_t leave_at = 0) {
+    bool left = false;          // the leaver stopped (its machine is gone)
+    uint64_t left_at_us = 0;
+    bool retired = false;
     g_now = 0;
     g_rng = 12345;
+    g_silent = -1;
     g_wire.clear();
     g_net = net;
     g_machines = machines;
@@ -136,11 +147,27 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     const n64net_rollback_callbacks cb0 = { Save, Load, Advance, nullptr, kSlots };
     for (uint64_t step = 0; step < 200000; step++) {
         bool done = true;
-        for (int i = 0; i < machines; i++) done &= g_m[i].tick >= kTicks;
+        for (int i = 0; i < machines; i++) done &= g_m[i].tick >= kTicks || (left && i == leaver);
         if (done) break;
         g_now += 1000;   // 1 ms per step; machines run a tick when 16.7 ms passed and they may
+        if (leaver >= 0 && !left && g_m[leaver].tick >= leave_at) {
+            left = true;
+            left_at_us = g_now;
+        }
+        // the host decides 300 ms after the leaver went silent: each of its players gets a CPU
+        if (left) g_silent = leaver;
+        if (left && !retired && g_now > left_at_us + 300000) {
+            retired = true;
+            for (int p = 0; p < 4; p++) {
+                if (!(g_m[leaver].mask & (1u << p))) continue;
+                const uint8_t act[2] = { 'C', (uint8_t)p };
+                uint32_t apply = 0;
+                if (!n64net_input_retire(g_m[0].net, p, act, sizeof(act), &apply)) { printf("%s: retire refused\n", name); return false; }
+            }
+        }
         // deliver
         for (auto it = g_wire.begin(); it != g_wire.end();) {
+            if (left && (it->to == leaver)) { it = g_wire.erase(it); continue; }
             if (it->at <= g_now) {
                 n64net_input_handle_packet(g_m[it->to].net, it->data.data(), (uint32_t)it->data.size());
                 it = g_wire.erase(it);
@@ -150,6 +177,7 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
         }
         for (int i = 0; i < machines; i++) {
             Machine &m = g_m[i];
+            if (left && i == leaver) continue;   // gone
             if (m.tick >= kTicks || g_now < (uint64_t)m.tick * 16667 + (uint64_t)i * 3000) continue;
             if (!m.sampled) {
                 n64net_rollback_callbacks cb = cb0;
@@ -177,10 +205,11 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
         g_now += 100000;
         for (auto &pk : g_wire) n64net_input_handle_packet(g_m[pk.to].net, pk.data.data(), (uint32_t)pk.data.size());
         g_wire.clear();
-        for (int i = 0; i < machines; i++) n64net_input_resend(g_m[i].net);
+        for (int i = 0; i < machines; i++) if (!(left && i == leaver)) n64net_input_resend(g_m[i].net);
     }
     for (int i = 0; i < machines; i++) {
         Machine &m = g_m[i];
+        if (left && i == leaver) continue;
         if (window > 0) {
             n64net_rollback_callbacks cb = cb0;
             cb.user = &m;
@@ -190,6 +219,7 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     // compare: every tick confirmed everywhere must hold the same state on every machine
     uint32_t confirmed = kTicks;
     for (int i = 0; i < machines; i++) {
+        if (left && i == leaver) continue;
         uint32_t c = n64net_input_confirmed_tick(g_m[i].net);
         if (c == UINT32_MAX) c = 0;
         confirmed = std::min(confirmed, std::min(c, g_m[i].tick - 1));
@@ -198,6 +228,7 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     uint32_t first_bad = UINT32_MAX;
     for (uint32_t t = 0; t <= confirmed && ok; t++) {
         for (int i = 1; i < machines; i++) {
+            if (left && i == leaver) continue;
             if (g_m[i].hist[t] != g_m[0].hist[t]) { first_bad = t; ok = false; break; }
         }
     }
@@ -206,6 +237,7 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     // that has no event is overkill here; instead check event visibility on each machine at event tick + delay
     int seen = 0;
     for (int i = 0; i < machines; i++) {
+        if (left && i == leaver) { seen++; continue; }
         uint8_t ev[N64NET_INPUT_MAX_EVENT];
         if (n64net_input_get_event(g_m[i].net, 0, event_at + delay, ev, sizeof(ev)) == 3 && ev[2] == 3) seen++;
     }
@@ -213,6 +245,7 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     // (bad_machine reports wrong ones), and none may see a desync when all agree
     for (uint32_t t = 60; t <= confirmed; t += 60) {
         for (int i = 0; i < machines; i++) {
+            if (left && i == leaver) continue;
             const uint32_t h = (uint32_t)g_m[i].hist[t] ^ (i == bad_machine ? 0x5A5Au : 0u);
             n64net_sync_record(g_m[i].net, t, 1, h);
         }
@@ -222,6 +255,24 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     int detected = 0;
     for (int i = 0; i < machines; i++) detected += n64net_sync_desynced(g_m[i].net, nullptr, nullptr);
     const bool sync_ok = bad_machine < 0 ? detected == 0 : detected == machines;
+    if (leaver >= 0) {   // the survivors played on past the drop-out, all agreeing on when the CPU came in
+        uint32_t applies[4] = {}, n = 0;
+        for (int i = 0; i < machines; i++) {
+            if (i == leaver) continue;
+            uint32_t last, apply;
+            for (int p = 0; p < 4; p++) {
+                if ((g_m[leaver].mask & (1u << p)) && n64net_input_retired(g_m[i].net, p, &last, &apply, nullptr, nullptr)) {
+                    if (n < 4) applies[n++] = apply;
+                }
+            }
+        }
+        bool same = n > 0;
+        for (uint32_t k = 1; k < n; k++) same &= applies[k] == applies[0];
+        if (!same || confirmed < kTicks - 40) {
+            printf("%s: drop-out: %u machines know it (same apply tick: %d), confirmed up to %u\n", name, n, same, confirmed);
+            ok = false;
+        }
+    }
     if (!sync_ok) printf("%s: sync check: %d of %d machines saw a desync (expected %d)\n", name, detected, machines,
                          bad_machine < 0 ? 0 : machines);
     ok = ok && sync_ok;
@@ -251,6 +302,9 @@ int main() {
     all &= Run("3 players on one machine + 1, rollback", one_device_two_machines, 2, 8, 2, bad, 400);
     all &= Run("4 machines, the last one desyncs (all must notice)", four, 4, 8, 2, bad, 300, 3);
     all &= Run("3 machines, the middle one desyncs", three_2local, 3, 8, 2, bad, 300, 1);
+    all &= Run("3 machines, one leaves; host gives its 2 players CPUs", three_2local, 3, 8, 2, bad, 200, -1, 1, 600);
+    all &= Run("4 machines, lockstep, one leaves", four, 4, 0, 3, bad, 200, -1, 3, 500);
+    all &= Run("2 machines, guest leaves (host plays on alone)", two, 2, 8, 2, bad, 200, -1, 1, 700);
     printf("%s\n", all ? "ALL PASS" : "SOME FAILED");
     return all ? 0 : 1;
 }

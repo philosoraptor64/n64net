@@ -29,7 +29,9 @@ namespace {
 
 constexpr uint8_t kVersion = 3;   // 3: several players per machine, events, per-peer echo
 constexpr uint32_t kRttRing = 90;  // round trips kept (auto delay uses their 90th percentile)
-constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3;
+constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3, kTypeRetire = 4;
+constexpr uint32_t kRetireTail = 64;      // the leaver's last inputs carried in a RETIRE packet
+constexpr uint32_t kRetireRepeats = 200;  // RETIRE packets sent with the next inputs (UDP: no ack needed)
 // Input packets whose frames carry the extended fields (right stick, buttons_hi). Only used when a
 // frame in the packet has one of them non-zero, so other games send exactly the old format.
 constexpr uint8_t kTypeFlagRightStick = 0x80;
@@ -130,6 +132,23 @@ struct n64net_input {
 
     bool rollback_pending = false;
     uint32_t rollback_tick = 0;
+    void RequestRollback(uint32_t tick) {
+        if (!rollback_pending || tick < rollback_tick) rollback_tick = tick;
+        rollback_pending = true;
+    }
+    uint32_t highest_got = 0;   // newest tick (+1) a remote player's input was asked for (simulated)
+
+    // Drop-outs (n64net_input_retire): a retired player's inputs are real up to retire_last, neutral and
+    // confirmed after it; the game applies retire_action at retire_apply. It stops being "remote" (nothing
+    // waits for it), so its stragglers are ignored.
+    bool retired[N64NET_INPUT_MAX_PLAYERS] = {};
+    uint32_t retire_last[N64NET_INPUT_MAX_PLAYERS] = {}, retire_apply[N64NET_INPUT_MAX_PLAYERS] = {};
+    uint8_t retire_action[N64NET_INPUT_MAX_PLAYERS][N64NET_INPUT_MAX_EVENT] = {};
+    uint8_t retire_action_len[N64NET_INPUT_MAX_PLAYERS] = {};
+    uint32_t retire_repeats[N64NET_INPUT_MAX_PLAYERS] = {};   // announcements still to send (the announcer)
+    void ApplyRetire(int p, uint32_t last, uint32_t apply, const uint8_t *action, uint32_t action_len,
+                     uint32_t tail_first, uint32_t tail_count, const n64net_pad *tail);
+    void SendRetire(int p);
     int resimulating = 0;
     uint32_t driver_tick = 0;  // the tick n64net_rollback_frame's current callback is about
     std::vector<uint32_t> slot_tick;
@@ -296,6 +315,10 @@ void n64net_input::UpdateAutoDelay(uint64_t now) {
 void n64net_input::SendInputs() {
     for (int p = 0; p < cfg.num_players; p++) {
         if (IsLocal(p)) SendInputsFor(p);
+        if (retire_repeats[p]) {
+            retire_repeats[p]--;
+            SendRetire(p);
+        }
     }
     last_send_usecs = Now();
 }
@@ -521,6 +544,92 @@ void n64net_input::HandleSync(Reader &r, uint8_t player, uint8_t count) {
 
 extern "C" {
 
+void n64net_input::SendRetire(int p) {
+    uint8_t buf[N64NET_INPUT_MAX_PACKET];
+    Writer w{buf};
+    w.U32(N64NET_INPUT_MAGIC);
+    w.U8(kVersion);
+    w.U8(kTypeRetire);
+    w.U8((uint8_t)cfg.local_player);
+    w.U8(0);
+    w.U32(cfg.session_id);
+    w.U8((uint8_t)p);
+    w.U32(retire_last[p]);
+    w.U32(retire_apply[p]);
+    w.U8(retire_action_len[p]);
+    for (uint32_t i = 0; i < retire_action_len[p]; i++) w.U8(retire_action[p][i]);
+    // the leaver's last inputs, for machines that missed some of them
+    const uint32_t last = retire_last[p];
+    uint32_t first = last + 1 >= kRetireTail ? last + 1 - kRetireTail : 0;
+    first = std::max(first, cfg.start_tick);
+    uint32_t count = 0;
+    for (uint32_t t = first; t <= last && last != kNoTick; t++) {
+        if (remote[p][t % kRing].tick != t) {   // (the announcer has every one of them: see n64net_input_retire)
+            first = t + 1;
+            count = 0;
+            continue;
+        }
+        count++;
+    }
+    w.U32(first);
+    w.U8((uint8_t)count);
+    for (uint32_t i = 0; i < count; i++) {
+        const n64net_pad &pad = remote[p][(first + i) % kRing].pad;
+        w.U16(pad.buttons);
+        w.U8((uint8_t)pad.stick_x);
+        w.U8((uint8_t)pad.stick_y);
+        w.U8((uint8_t)pad.rstick_x);
+        w.U8((uint8_t)pad.rstick_y);
+        w.U16(pad.buttons_hi);
+    }
+    w.U32(Fnv(buf, (uint32_t)(w.p - buf)));
+    Send(buf, (uint32_t)(w.p - buf));
+}
+
+// Player p leaves: inputs up to `last` are real (missing ones taken from the tail), neutral after it.
+// Anything already simulated with other inputs, and anything simulated at or after `apply` (where the
+// game changes the player), is rolled back.
+void n64net_input::ApplyRetire(int p, uint32_t last, uint32_t apply, const uint8_t *action, uint32_t action_len,
+                               uint32_t tail_first, uint32_t tail_count, const n64net_pad *tail) {
+    for (uint32_t i = 0; i < tail_count; i++) {
+        const uint32_t t = tail_first + i;
+        if (t < next_needed[p] || t > last) continue;
+        Slot &s = remote[p][t % kRing];
+        if (s.tick == t) continue;
+        s.tick = t;
+        s.pad = tail[i];
+        s.ev_len = 0;
+        const Used &u = used[p][t % kRing];
+        if (u.tick == t && u.predicted && !PadEq(u.pad, s.pad)) RequestRollback(t);
+    }
+    while (remote[p][next_needed[p] % kRing].tick == next_needed[p] && next_needed[p] <= last) next_needed[p]++;
+    if (last != kNoTick && next_needed[p] <= last) {
+        Log("n64net input: player %d left; ticks %u..%u of its inputs never arrived here (played as guesses)\n",
+            p + 1, next_needed[p], last);
+    }
+    // ticks after `last` already simulated with a guess that wasn't "nothing pressed"
+    const uint32_t from = last == kNoTick ? cfg.start_tick : last + 1;
+    for (uint32_t t = from; t < highest_got; t++) {
+        const Used &u = used[p][t % kRing];
+        if (u.tick == t && (u.pad.buttons || u.pad.stick_x || u.pad.stick_y || u.pad.rstick_x || u.pad.rstick_y ||
+                            u.pad.buttons_hi)) {
+            RequestRollback(t);
+            break;
+        }
+    }
+    if (highest_got > apply) RequestRollback(apply);   // the game must change the player at `apply`
+    retired[p] = true;
+    retire_last[p] = last;
+    retire_apply[p] = apply;
+    retire_action_len[p] = (uint8_t)std::min<uint32_t>(action_len, N64NET_INPUT_MAX_EVENT);
+    memcpy(retire_action[p], action, retire_action_len[p]);
+    remote_mask &= ~(1u << p);
+    peer_advantage_valid[p] = false;
+    peer_wish_of[p] = 0;
+    Log("n64net input: player %d left: real inputs up to tick %d, the game changes it at tick %u\n", p + 1,
+        last == kNoTick ? -1 : (int)last, apply);
+}
+
 n64net_input *n64net_input_create(const n64net_input_config *config) {
     if (!config || config->num_players < 1 || config->num_players > N64NET_INPUT_MAX_PLAYERS ||
         config->local_player < 0 || config->local_player >= config->num_players) {
@@ -632,7 +741,13 @@ int n64net_input_get(n64net_input *net, int player, uint32_t tick, n64net_pad *o
         net->LocalAt(player, tick, out);  // neutral if not scheduled (before the first sample)
         return 0;
     }
+    if (net->retired[player]) {   // dropped out: its real inputs up to the agreed tick, then nothing
+        const Slot &s = net->remote[player][tick % kRing];
+        if (tick <= net->retire_last[player] && s.tick == tick) *out = s.pad;
+        return 0;
+    }
     if (!net->IsRemote(player)) return 0;  // CPU / empty: neutral
+    net->highest_got = std::max(net->highest_got, tick + 1);
     const Slot &s = net->remote[player][tick % kRing];
     Used &u = net->used[player][tick % kRing];
     u.tick = tick;
@@ -678,6 +793,34 @@ int n64net_input_handle_packet(n64net_input *net, const uint8_t *data, uint32_t 
     case kTypeSync:
         net->HandleSync(r, player, count);
         break;
+    case kTypeRetire: {
+        const uint8_t who = r.U8();
+        const uint32_t last = r.U32(), apply = r.U32();
+        const uint8_t alen = r.U8();
+        uint8_t action[N64NET_INPUT_MAX_EVENT] = {};
+        for (uint32_t i = 0; i < alen && i < N64NET_INPUT_MAX_EVENT; i++) action[i] = r.U8();
+        const uint32_t tail_first = r.U32();
+        const uint8_t tail_count = r.U8();
+        n64net_pad tail[kRetireTail];
+        for (uint32_t i = 0; i < tail_count && i < kRetireTail; i++) {
+            tail[i].buttons = r.U16();
+            tail[i].stick_x = (int8_t)r.U8();
+            tail[i].stick_y = (int8_t)r.U8();
+            tail[i].rstick_x = (int8_t)r.U8();
+            tail[i].rstick_y = (int8_t)r.U8();
+            tail[i].buttons_hi = r.U16();
+        }
+        if (!r.ok || alen > N64NET_INPUT_MAX_EVENT || tail_count > kRetireTail || who >= N64NET_INPUT_MAX_PLAYERS) {
+            net->stats.packets_dropped++;
+            break;
+        }
+        net->stats.packets_received++;
+        net->last_recv_usecs = net->Now();
+        if (!net->retired[who] && !net->IsLocal(who)) {
+            net->ApplyRetire(who, last, apply, action, alen, tail_first, tail_count, tail);
+        }
+        break;
+    }
     case kTypeAway:
     case kTypeBack:
         net->stats.packets_received++;
@@ -851,3 +994,35 @@ uint32_t n64net_rollback_callback_tick(n64net_input *net) { return net->driver_t
 int n64net_rollback_resimulating(n64net_input *net) { return net->resimulating; }
 
 } // extern "C"
+
+int n64net_input_retire(n64net_input *net, int player, const void *action, uint32_t size, uint32_t *apply_tick) {
+    if (!net || player < 0 || player >= net->cfg.num_players || net->IsLocal(player) || net->retired[player] ||
+        size > N64NET_INPUT_MAX_EVENT) {
+        return 0;
+    }
+    // the last tick of this player everyone gets: what arrived here without a gap
+    const uint32_t last = net->next_needed[player] > net->cfg.start_tick ? net->next_needed[player] - 1 : kNoTick;
+    // the change happens after every tick this machine may already have simulated
+    uint32_t apply = std::max(last == kNoTick ? net->cfg.start_tick : last + 1, net->last_sample_tick + 1);
+    apply = std::max(apply, net->highest_got);
+    net->ApplyRetire(player, last, apply, (const uint8_t *)action, size, 0, 0, nullptr);
+    net->retire_repeats[player] = kRetireRepeats;
+    net->SendRetire(player);
+    if (apply_tick) *apply_tick = apply;
+    return 1;
+}
+
+int n64net_input_retired(n64net_input *net, int player, uint32_t *last_tick, uint32_t *apply_tick, void *action,
+                         uint32_t *size) {
+    if (!net || player < 0 || player >= N64NET_INPUT_MAX_PLAYERS || !net->retired[player]) return 0;
+    if (last_tick) *last_tick = net->retire_last[player];
+    if (apply_tick) *apply_tick = net->retire_apply[player];
+    if (action && size) {
+        const uint32_t n = std::min<uint32_t>(*size, net->retire_action_len[player]);
+        memcpy(action, net->retire_action[player], n);
+        *size = net->retire_action_len[player];
+    }
+    return 1;
+}
+
+int n64net_input_remote_players(n64net_input *net) { return net ? (int)__builtin_popcount(net->remote_mask) : 0; }

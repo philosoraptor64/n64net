@@ -109,6 +109,26 @@ int n64net_input_set_event(n64net_input *net, const void *data, uint32_t size);
  * input arrives, like a prediction). Call after n64net_input_get for the tick. */
 uint32_t n64net_input_get_event(n64net_input *net, int player, uint32_t tick, void *out, uint32_t cap);
 
+/* --- Drop-outs ---------------------------------------------------------------
+ * A player whose machine left. On the machine that decides (the session's host):
+ * n64net_input_retire() picks the player's last tick everyone gets (what arrived
+ * here without a gap) and a later tick at which the game changes the player
+ * (`action`, up to N64NET_INPUT_MAX_EVENT bytes, opaque: "a CPU takes over",
+ * "removed", "idle"), applies it here and announces it to every other machine
+ * (repeated with the next input packets; the leaver's last inputs travel with it
+ * for machines that missed some). Everywhere the player's inputs are then real up
+ * to that tick and "nothing pressed" after it, nothing waits for it any more, and
+ * a machine that already simulated past either point gets a rollback request.
+ * Each machine's game asks n64net_input_retired() every tick and makes the change
+ * when it plays tick `apply_tick` (also in a resimulation: it is game state).
+ * Returns 1 (and the apply tick), 0 if the player isn't remote or already left. */
+int n64net_input_retire(n64net_input *net, int player, const void *action, uint32_t size, uint32_t *apply_tick);
+/* 1 if `player` left (any machine), with the agreed ticks and the action. *size: in = cap, out = length. */
+int n64net_input_retired(n64net_input *net, int player, uint32_t *last_tick, uint32_t *apply_tick, void *action,
+                         uint32_t *size);
+/* Remote players still taking part. */
+int n64net_input_remote_players(n64net_input *net);
+
 /* 1 if `tick` may be simulated now: every remote player's inputs are confirmed
  * up to at least tick - rollback_window (lockstep: up to tick). */
 int n64net_input_ready(n64net_input *net, uint32_t tick);
