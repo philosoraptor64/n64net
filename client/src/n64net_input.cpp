@@ -14,6 +14,16 @@
  *   sync:   magic | version | type=1 | player | count | session |
  *           count x (u32 tick, u8 kind, u32 hash) | checksum
  *   away:   magic | version | type=2 (away) or 3 (back) | player | 0 | session | checksum
+ *   retire: magic | version | type=4 | sender | 0 | session | u8 player | u32 last | u32 apply |
+ *           u8 action length, action | u32 tail first | u8 tail count, tail pads (8 bytes) | checksum
+ *   log:    magic | version | type=5 (0x80: 8-byte pads) | sender | count (ticks) | session |
+ *           u8 to (the joiner's first player) | u32 first tick | u8 players |
+ *           players x (u8 state: 1 retired, 2 rejoined | u32 last | u32 apply | u32 rejoin |
+ *                      u8 action length, action) |
+ *           count x players x pad (4 or 8 bytes) | u8 events, events x (u16 tick offset, u8 player,
+ *           u8 length, bytes) | checksum                                   (host -> joiner: the input log)
+ *   have:   magic | version | type=6 | sender | 0 | session | u32 log ticks received | checksum (joiner -> host)
+ *   rejoin: magic | version | type=7 | sender | 0 | session | u8 player mask | u32 live tick | checksum
  * Inputs are sent oldest-unacknowledged first, up to 16 per packet, so a
  * lost packet is covered by the next one and a long gap still drains. */
 #include "n64net_input.h"
@@ -23,13 +33,19 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <vector>
 
 namespace {
 
 constexpr uint8_t kVersion = 3;   // 3: several players per machine, events, per-peer echo
 constexpr uint32_t kRttRing = 90;  // round trips kept (auto delay uses their 90th percentile)
-constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3, kTypeRetire = 4;
+constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3, kTypeRetire = 4, kTypeLog = 5,
+                  kTypeHave = 6, kTypeRejoin = 7;
+// Joining a running match: the host streams the log to the joiner, up to this many packets per send; when the
+// joiner has all but kJoinNear ticks of it, the players go live kJoinMargin ticks after the host's newest tick.
+constexpr uint32_t kLogPacketsPerSend = 16, kJoinNear = 60, kJoinMargin = 45;
+constexpr uint32_t kRejoinRepeats = 200;
 constexpr uint32_t kRetireTail = 64;      // the leaver's last inputs carried in a RETIRE packet
 constexpr uint32_t kRetireRepeats = 200;  // RETIRE packets sent with the next inputs (UDP: no ack needed)
 // Input packets whose frames carry the extended fields (right stick, buttons_hi). Only used when a
@@ -58,6 +74,11 @@ struct Used {
     uint32_t tick = kNoTick;
     n64net_pad pad = {0, 0, 0};
     bool predicted = false;
+};
+struct LogEvent {
+    uint32_t tick;
+    uint8_t player, len;
+    uint8_t ev[N64NET_INPUT_MAX_EVENT];
 };
 struct SyncEntry {
     uint32_t tick = kNoTick;
@@ -149,6 +170,50 @@ struct n64net_input {
     void ApplyRetire(int p, uint32_t last, uint32_t apply, const uint8_t *action, uint32_t action_len,
                      uint32_t tail_first, uint32_t tail_count, const n64net_pad *tail);
     void SendRetire(int p);
+    // Joining a running match. join_from[p]: the tick a joiner's machine took player p over (kNoTick: not
+    // rejoined); before it, p follows the retirement rule.
+    uint32_t join_from[N64NET_INPUT_MAX_PLAYERS];
+    void ApplyRejoin(uint32_t mask, uint32_t tick);
+    void SendRejoin();
+    uint32_t rejoin_mask = 0, rejoin_tick = kNoTick, rejoin_repeats = 0;   // the announcer's last announcement
+    // The log: every player's confirmed inputs (and events) from start_tick to log_end - 1.
+    std::vector<n64net_pad> log_pad[N64NET_INPUT_MAX_PLAYERS];
+    std::vector<LogEvent> log_events;   // by tick
+    uint32_t log_end = 0;
+    bool log_ext = false;   // a logged pad uses the extended fields
+    void ExtendLog();
+    bool LogPad(int p, uint32_t tick, n64net_pad *out) const {
+        if (tick < cfg.start_tick || tick >= log_end) return false;
+        *out = log_pad[p][tick - cfg.start_tick];
+        return true;
+    }
+    const LogEvent *LogEventAt(int p, uint32_t tick) const {
+        auto it = std::lower_bound(log_events.begin(), log_events.end(), tick,
+                                   [](const LogEvent &e, uint32_t t) { return e.tick < t; });
+        for (; it != log_events.end() && it->tick == tick; ++it) if (it->player == p) return &*it;
+        return nullptr;
+    }
+    // the host serving a joiner
+    uint32_t admit_mask = 0;        // its players (0: none)
+    uint32_t admit_have = 0;        // log ticks it has (from start_tick: the next it needs)
+    uint32_t admit_sent = 0;        // next log tick to send
+    uint64_t admit_progress_at = 0; // when admit_have last grew
+    void ServeJoiner();
+    void SendLog(uint32_t first, uint32_t *next);
+    // the joiner
+    uint32_t live_from = kNoTick;   // its players' first live tick (kNoTick: not known yet)
+    uint32_t local_base = 0;        // the first tick of its local streams (start_tick, or live_from)
+    // pieces of the log that arrived ahead of a missing one (first tick -> pads, events)
+    struct Piece { std::vector<n64net_pad> pads; std::vector<LogEvent> events; bool ext; };
+    std::map<uint32_t, Piece> log_ahead;
+    void AppendLog(uint32_t first, uint32_t count, const std::vector<n64net_pad> &pads, const std::vector<LogEvent> &evs,
+                   bool ext);
+    uint64_t have_sent_at = 0;
+    uint32_t have_sent = 0;
+    void SendHave(bool force);
+    void HandleLog(Reader &r, uint8_t count, bool ext);
+    bool CatchingUp() const { return cfg.joining && (live_from == kNoTick || log_end < live_from); }
+    bool FromLog(uint32_t tick) const { return cfg.joining && (live_from == kNoTick || tick < live_from); }
     int resimulating = 0;
     uint32_t driver_tick = 0;  // the tick n64net_rollback_frame's current callback is about
     std::vector<uint32_t> slot_tick;
@@ -209,7 +274,7 @@ struct n64net_input {
         for (int s = 0; s < cfg.num_players; s++) {
             if (IsRemote(s)) m = std::min(m, ack_from[s][p]);
         }
-        return m == kNoTick ? cfg.start_tick : m;
+        return m == kNoTick ? local_base : m;
     }
     void Send(const uint8_t *data, uint32_t size) {
         if (cfg.send) {
@@ -320,6 +385,13 @@ void n64net_input::SendInputs() {
             SendRetire(p);
         }
     }
+    if (rejoin_repeats) {
+        rejoin_repeats--;
+        SendRejoin();
+    }
+    ExtendLog();
+    ServeJoiner();
+    if (CatchingUp()) SendHave(false);
     last_send_usecs = Now();
 }
 
@@ -327,7 +399,7 @@ void n64net_input::SendInputs() {
 void n64net_input::SendInputsFor(int player) {
     uint8_t buf[N64NET_INPUT_MAX_PACKET];
     Writer w{buf};
-    const uint32_t first = std::max(FirstNeededFrom(player), cfg.start_tick);
+    const uint32_t first = std::max(FirstNeededFrom(player), local_base);
     uint32_t avail = 0;
     if (local_started && first <= local_last) {
         avail = std::min(kMaxFramesPerPacket, local_last - first + 1);
@@ -619,6 +691,7 @@ void n64net_input::ApplyRetire(int p, uint32_t last, uint32_t apply, const uint8
     }
     if (highest_got > apply) RequestRollback(apply);   // the game must change the player at `apply`
     retired[p] = true;
+    join_from[p] = kNoTick;
     retire_last[p] = last;
     retire_apply[p] = apply;
     retire_action_len[p] = (uint8_t)std::min<uint32_t>(action_len, N64NET_INPUT_MAX_EVENT);
@@ -628,6 +701,300 @@ void n64net_input::ApplyRetire(int p, uint32_t last, uint32_t apply, const uint8
     peer_wish_of[p] = 0;
     Log("n64net input: player %d left: real inputs up to tick %d, the game changes it at tick %u\n", p + 1,
         last == kNoTick ? -1 : (int)last, apply);
+}
+
+// --- Joining a running match ---------------------------------------------------------------------------
+
+// Append every newly confirmed tick to the log (what n64net_input_get returns for it, for every player).
+void n64net_input::ExtendLog() {
+    if (CatchingUp()) return;   // the joiner: the host's log comes first
+    const uint32_t conf = n64net_input_confirmed_tick(this);
+    if (conf == kNoTick) return;
+    while (log_end <= conf) {
+        const uint32_t t = log_end;
+        for (int p = 0; p < cfg.num_players; p++) {
+            n64net_pad pad = {0, 0, 0};
+            const Slot *sl = nullptr;
+            if (IsLocal(p)) {
+                sl = LocalSlot(p, t);
+            } else if (retired[p] && t < join_from[p]) {
+                const Slot &r = remote[p][t % kRing];
+                if (t <= retire_last[p] && r.tick == t) pad = r.pad;
+            } else if (IsRemote(p)) {
+                const Slot &r = remote[p][t % kRing];
+                if (r.tick == t) sl = &r;
+            }
+            if (sl) pad = sl->pad;
+            log_pad[p].push_back(pad);
+            log_ext |= pad.rstick_x != 0 || pad.rstick_y != 0 || pad.buttons_hi != 0;
+            if (sl && sl->ev_len) {
+                LogEvent e = {};
+                e.tick = t;
+                e.player = (uint8_t)p;
+                e.len = sl->ev_len;
+                memcpy(e.ev, sl->ev, sl->ev_len);
+                log_events.push_back(e);
+            }
+        }
+        log_end++;
+    }
+}
+
+// One log packet from tick `first` (as many ticks as fit); *next = the tick after the last one sent.
+void n64net_input::SendLog(uint32_t first, uint32_t *next) {
+    uint8_t buf[N64NET_INPUT_MAX_PACKET];
+    Writer w{buf};
+    const int np = cfg.num_players;
+    const uint32_t padsz = log_ext ? 8 : 4;
+    w.U32(N64NET_INPUT_MAGIC);
+    w.U8(kVersion);
+    w.U8(kTypeLog | (log_ext ? kTypeFlagRightStick : 0));
+    w.U8((uint8_t)cfg.local_player);
+    uint8_t *count_at = w.p;
+    w.U8(0);
+    w.U32(cfg.session_id);
+    w.U8((uint8_t)__builtin_ctz(admit_mask));
+    w.U32(first);
+    w.U8((uint8_t)np);
+    for (int p = 0; p < np; p++) {
+        w.U8((uint8_t)((retired[p] ? 1 : 0) | (join_from[p] != kNoTick ? 2 : 0)));
+        w.U32(retire_last[p]);
+        w.U32(retire_apply[p]);
+        w.U32(join_from[p]);
+        w.U8(retire_action_len[p]);
+        for (uint32_t i = 0; i < retire_action_len[p]; i++) w.U8(retire_action[p][i]);
+    }
+    // ticks that fit, with their events
+    auto ev_begin = std::lower_bound(log_events.begin(), log_events.end(), first,
+                                     [](const LogEvent &e, uint32_t t) { return e.tick < t; });
+    uint32_t used = (uint32_t)(w.p - buf) + 1 + 4;   // + event count + checksum
+    uint32_t count = 0;
+    auto ev_end = ev_begin;
+    while (count < 255 && first + count < log_end) {
+        const uint32_t t = first + count;
+        uint32_t cost = (uint32_t)np * padsz;
+        auto e = ev_end;
+        for (; e != log_events.end() && e->tick == t; ++e) cost += 4 + e->len;
+        if (used + cost > N64NET_INPUT_MAX_PACKET) break;
+        used += cost;
+        ev_end = e;
+        count++;
+    }
+    *count_at = (uint8_t)count;
+    for (uint32_t i = 0; i < count; i++) {
+        for (int p = 0; p < np; p++) {
+            const n64net_pad &pad = log_pad[p][first + i - cfg.start_tick];
+            w.U16(pad.buttons);
+            w.U8((uint8_t)pad.stick_x);
+            w.U8((uint8_t)pad.stick_y);
+            if (log_ext) {
+                w.U8((uint8_t)pad.rstick_x);
+                w.U8((uint8_t)pad.rstick_y);
+                w.U16(pad.buttons_hi);
+            }
+        }
+    }
+    w.U8((uint8_t)(ev_end - ev_begin));
+    for (auto e = ev_begin; e != ev_end; ++e) {
+        w.U16((uint16_t)(e->tick - first));
+        w.U8(e->player);
+        w.U8(e->len);
+        for (uint32_t k = 0; k < e->len; k++) w.U8(e->ev[k]);
+    }
+    w.U32(Fnv(buf, (uint32_t)(w.p - buf)));
+    const int to = __builtin_ctz(admit_mask);
+    if (cfg.send_to) {
+        cfg.send_to(cfg.user, to, buf, (uint32_t)(w.p - buf));
+        stats.packets_sent++;
+    } else {
+        Send(buf, (uint32_t)(w.p - buf));
+    }
+    *next = first + count;
+}
+
+// The joiner: a piece of the host's log (and every player's retirement state).
+void n64net_input::HandleLog(Reader &r, uint8_t count, bool ext) {
+    const uint8_t to = r.U8();
+    const uint32_t first = r.U32();
+    const uint8_t np = r.U8();
+    if (!cfg.joining || to != cfg.local_player || np != cfg.num_players) return;
+    struct Info { uint8_t state; uint32_t last, apply, rejoin; uint8_t alen; uint8_t action[N64NET_INPUT_MAX_EVENT]; };
+    Info info[N64NET_INPUT_MAX_PLAYERS] = {};
+    for (int p = 0; p < np; p++) {
+        info[p].state = r.U8();
+        info[p].last = r.U32();
+        info[p].apply = r.U32();
+        info[p].rejoin = r.U32();
+        info[p].alen = r.U8();
+        if (info[p].alen > N64NET_INPUT_MAX_EVENT) { r.ok = false; break; }
+        for (uint32_t i = 0; i < info[p].alen; i++) info[p].action[i] = r.U8();
+    }
+    std::vector<n64net_pad> pads((size_t)count * np);
+    for (auto &pad : pads) {
+        pad = n64net_pad{0, 0, 0};
+        pad.buttons = r.U16();
+        pad.stick_x = (int8_t)r.U8();
+        pad.stick_y = (int8_t)r.U8();
+        if (ext) {
+            pad.rstick_x = (int8_t)r.U8();
+            pad.rstick_y = (int8_t)r.U8();
+            pad.buttons_hi = r.U16();
+        }
+    }
+    const uint8_t nev = r.U8();
+    std::vector<LogEvent> evs(nev);
+    for (auto &e : evs) {
+        e.tick = first + r.U16();
+        e.player = r.U8();
+        e.len = r.U8();
+        if (e.len > N64NET_INPUT_MAX_EVENT || e.player >= np) { r.ok = false; break; }
+        for (uint32_t k = 0; k < e.len; k++) e.ev[k] = r.U8();
+    }
+    if (!r.ok) {
+        stats.packets_dropped++;
+        return;
+    }
+    stats.packets_received++;
+    last_recv_usecs = Now();
+    // the retirement state as the host has it (for this machine's game: who is a CPU from when)
+    for (int p = 0; p < np; p++) {
+        const Info &in = info[p];
+        if (!(in.state & 1)) continue;
+        retired[p] = true;
+        retire_last[p] = in.last;
+        retire_apply[p] = in.apply;
+        retire_action_len[p] = in.alen;
+        memcpy(retire_action[p], in.action, in.alen);
+        if (!IsLocal(p)) {
+            join_from[p] = (in.state & 2) ? in.rejoin : kNoTick;
+            if (join_from[p] == kNoTick) remote_mask &= ~(1u << p);
+            else remote_mask |= 1u << p;
+        }
+    }
+    if (first > log_end) {   // a piece before it is missing: keep this one for later
+        if (log_ahead.size() < 4096) log_ahead[first] = Piece{ std::move(pads), std::move(evs), ext };
+    } else {
+        AppendLog(first, count, pads, evs, ext);
+        // and the pieces that were waiting for it
+        for (auto it = log_ahead.begin(); it != log_ahead.end() && it->first <= log_end;) {
+            const uint32_t n = (uint32_t)(it->second.pads.size() / cfg.num_players);
+            AppendLog(it->first, n, it->second.pads, it->second.events, it->second.ext);
+            it = log_ahead.erase(it);
+        }
+    }
+    SendHave(false);
+}
+
+void n64net_input::AppendLog(uint32_t first, uint32_t count, const std::vector<n64net_pad> &pads,
+                             const std::vector<LogEvent> &evs, bool ext) {
+    const int np = cfg.num_players;
+    if (first > log_end || first + count <= log_end) return;
+    for (uint32_t i = log_end - first; i < count; i++) {
+        for (int p = 0; p < np; p++) log_pad[p].push_back(pads[i * np + p]);
+    }
+    for (const LogEvent &e : evs) {
+        if (e.tick >= log_end) log_events.push_back(e);
+    }
+    log_end = first + count;
+    log_ext |= ext;
+}
+
+void n64net_input::SendHave(bool force) {
+    const uint64_t now = Now();
+    if (!force && !(log_end != have_sent && now - have_sent_at >= 3000) && now - have_sent_at < 50000) return;
+    uint8_t buf[32];
+    Writer w{buf};
+    w.U32(N64NET_INPUT_MAGIC);
+    w.U8(kVersion);
+    w.U8(kTypeHave);
+    w.U8((uint8_t)cfg.local_player);
+    w.U8(0);
+    w.U32(cfg.session_id);
+    w.U32(log_end);
+    w.U32(Fnv(buf, (uint32_t)(w.p - buf)));
+    Send(buf, (uint32_t)(w.p - buf));
+    have_sent = log_end;
+    have_sent_at = now;
+}
+
+// The host: stream the log to the joiner; when it is nearly caught up, announce the live tick.
+void n64net_input::ServeJoiner() {
+    if (!admit_mask) return;
+    const uint64_t now = Now();
+    if (admit_sent < admit_have) admit_sent = admit_have;
+    uint64_t rtt = 100000;
+    if (const uint32_t n = std::min(rtt_count, kRttRing)) {
+        uint64_t sum = 0;
+        for (uint32_t i = 0; i < n; i++) sum += rtt_samples[i];
+        rtt = sum / n;
+    }
+    if (now - admit_progress_at > std::max<uint64_t>(60000, 2 * rtt + 30000)) {
+        // nothing new arrived there for a while (a lost piece): resend from what it has
+        admit_sent = admit_have;
+        admit_progress_at = now;
+    }
+    for (uint32_t k = 0; k < kLogPacketsPerSend && admit_sent < log_end; k++) SendLog(admit_sent, &admit_sent);
+    if (rejoin_tick == kNoTick && log_end - std::min(admit_have, log_end) <= kJoinNear) {
+        uint32_t live = std::max(highest_got, last_sample_tick + 1);
+        live = std::max(live, local_started ? local_last + 1 : local_base);
+        live += kJoinMargin;
+        rejoin_mask = admit_mask;
+        rejoin_tick = live;
+        rejoin_repeats = kRejoinRepeats;
+        ApplyRejoin(admit_mask, live);
+        SendRejoin();
+    }
+    if (rejoin_tick != kNoTick && admit_have >= rejoin_tick) {
+        Log("n64net input: the joiner has caught up (players %x live from tick %u)\n", admit_mask, rejoin_tick);
+        admit_mask = 0;
+    }
+}
+
+void n64net_input::SendRejoin() {
+    uint8_t buf[32];
+    Writer w{buf};
+    w.U32(N64NET_INPUT_MAGIC);
+    w.U8(kVersion);
+    w.U8(kTypeRejoin);
+    w.U8((uint8_t)cfg.local_player);
+    w.U8(0);
+    w.U32(cfg.session_id);
+    w.U8((uint8_t)rejoin_mask);
+    w.U32(rejoin_tick);
+    w.U32(Fnv(buf, (uint32_t)(w.p - buf)));
+    Send(buf, (uint32_t)(w.p - buf));
+}
+
+// Players in `mask` are human again from `tick`, driven by the joiner's machine.
+void n64net_input::ApplyRejoin(uint32_t mask, uint32_t tick) {
+    bool mine = false;
+    for (int p = 0; p < cfg.num_players; p++) {
+        if (!(mask & (1u << p)) || join_from[p] == tick) continue;
+        join_from[p] = tick;
+        if (IsLocal(p)) {   // this machine is the joiner
+            mine = true;
+            continue;
+        }
+        remote_mask |= 1u << p;
+        next_needed[p] = std::max(next_needed[p], tick);
+        highest[p] = std::max(highest[p], tick);
+        peer_advantage_valid[p] = false;
+        for (int q = 0; q < cfg.num_players; q++) {
+            if (IsLocal(q)) ack_from[p][q] = std::max(ack_from[p][q], tick);
+        }
+        if (highest_got > tick) RequestRollback(tick);
+        Log("n64net input: player %d is back (a new machine) from tick %u\n", p + 1, tick);
+    }
+    if (mine && live_from == kNoTick) {
+        live_from = tick;
+        local_base = tick;
+        for (int q = 0; q < cfg.num_players; q++) {
+            if (!IsRemote(q)) continue;
+            next_needed[q] = std::max(next_needed[q], tick);
+            while (remote[q][next_needed[q] % kRing].tick == next_needed[q]) next_needed[q]++;
+        }
+        Log("n64net input: joining: live from tick %u (log %u ticks so far)\n", tick, log_end - cfg.start_tick);
+    }
 }
 
 n64net_input *n64net_input_create(const n64net_input_config *config) {
@@ -644,14 +1011,18 @@ n64net_input *n64net_input_create(const n64net_input_config *config) {
     net->remote_mask = config->remote_mask ? config->remote_mask : (all & ~net->local_mask);
     net->remote_mask &= ~net->local_mask;
     net->delay = config->input_delay;
+    net->local_base = config->start_tick;
+    net->log_end = config->start_tick;
+    net->admit_have = net->admit_sent = config->start_tick;
     for (int p = 0; p < N64NET_INPUT_MAX_PLAYERS; p++) {
+        net->join_from[p] = kNoTick;
         net->local[p].resize(kRing);
         net->remote[p].resize(kRing);
         net->used[p].resize(kRing);
         net->next_needed[p] = config->start_tick;
         for (int q = 0; q < N64NET_INPUT_MAX_PLAYERS; q++) net->ack_from[p][q] = config->start_tick;
     }
-    if (net->delay > 0) {
+    if (net->delay > 0 && !config->joining) {
         // The first `delay` ticks are neutral on every machine, and known now:
         // a side waiting for them must not depend on the other's first sample
         // (both would wait for each other in lockstep).
@@ -669,9 +1040,18 @@ void n64net_input_destroy(n64net_input *net) { delete net; }
 void n64net_input::SetLocalPads(uint32_t tick, const n64net_pad *pads) {
     UpdateAutoDelay(Now());
     const uint32_t target = tick + delay;
+    if (cfg.joining && (live_from == kNoTick || target < live_from)) {
+        // a joiner before its live tick: its players' inputs there are in the host's log
+        for (int p = 0; p < cfg.num_players; p++) {
+            if (IsLocal(p)) last_pad[p] = pads[p];
+        }
+        last_sample_tick = tick;
+        SendInputs();
+        return;
+    }
     if (!local_started) {
         // Ticks before the first sample lands are neutral on every machine.
-        for (uint32_t t = cfg.start_tick; t < target; t++) StoreAllLocal(t, nullptr);
+        for (uint32_t t = local_base; t < target; t++) StoreAllLocal(t, nullptr);
         local_started = true;
         local_last = target - 1;
     }
@@ -715,6 +1095,13 @@ int n64net_input_set_event(n64net_input *net, const void *data, uint32_t size) {
 
 uint32_t n64net_input_get_event(n64net_input *net, int player, uint32_t tick, void *out, uint32_t cap) {
     const Slot *sl = nullptr;
+    if (net->FromLog(tick)) {
+        const LogEvent *e = player >= 0 && player < net->cfg.num_players ? net->LogEventAt(player, tick) : nullptr;
+        if (!e) return 0;
+        const uint32_t n = std::min<uint32_t>(e->len, cap);
+        memcpy(out, e->ev, n);
+        return e->len;
+    }
     if (net->IsLocal(player)) {
         sl = net->LocalSlot(player, tick);
     } else if (net->IsRemote(player)) {
@@ -728,6 +1115,7 @@ uint32_t n64net_input_get_event(n64net_input *net, int player, uint32_t tick, vo
 }
 
 int n64net_input_ready(n64net_input *net, uint32_t tick) {
+    if (net->FromLog(tick)) return tick < net->log_end ? 1 : 0;
     const uint32_t needed = net->MinNextNeeded();
     if (needed == kNoTick) return 1;  // no remote players
     // Confirmed up to needed - 1; ready if that is >= tick - window.
@@ -737,11 +1125,15 @@ int n64net_input_ready(n64net_input *net, uint32_t tick) {
 int n64net_input_get(n64net_input *net, int player, uint32_t tick, n64net_pad *out) {
     *out = n64net_pad{0, 0, 0};
     if (player < 0 || player >= net->cfg.num_players) return 0;
+    if (net->FromLog(tick)) {   // a joiner catching up: the host's log
+        net->LogPad(player, tick, out);
+        return 0;
+    }
     if (net->IsLocal(player)) {
         net->LocalAt(player, tick, out);  // neutral if not scheduled (before the first sample)
         return 0;
     }
-    if (net->retired[player]) {   // dropped out: its real inputs up to the agreed tick, then nothing
+    if (net->retired[player] && tick < net->join_from[player]) {   // dropped out: its real inputs up to the agreed tick, then nothing (until a joiner takes it over)
         const Slot &s = net->remote[player][tick % kRing];
         if (tick <= net->retire_last[player] && s.tick == tick) *out = s.pad;
         return 0;
@@ -780,8 +1172,10 @@ int n64net_input_handle_packet(n64net_input *net, const uint8_t *data, uint32_t 
     // Checksum: the last 4 bytes cover everything before them.
     const uint32_t sum = ((uint32_t)data[size - 4] << 24) | ((uint32_t)data[size - 3] << 16) |
                          ((uint32_t)data[size - 2] << 8) | data[size - 1];
+    // (a joiner's "have" packets come from a player that is still retired)
+    const uint8_t base_type = type & ~(kTypeFlagRightStick | kTypeFlagEvents);
     if (version != kVersion || session != net->cfg.session_id || sum != Fnv(data, size - 4) ||
-        !net->IsRemote(player)) {
+        player >= N64NET_INPUT_MAX_PLAYERS || (!net->IsRemote(player) && base_type != kTypeHave)) {
         net->stats.packets_dropped++;
         return 1;
     }
@@ -816,9 +1210,30 @@ int n64net_input_handle_packet(n64net_input *net, const uint8_t *data, uint32_t 
         }
         net->stats.packets_received++;
         net->last_recv_usecs = net->Now();
-        if (!net->retired[who] && !net->IsLocal(who)) {
+        if ((!net->retired[who] || net->join_from[who] != kNoTick) && !net->IsLocal(who)) {
             net->ApplyRetire(who, last, apply, action, alen, tail_first, tail_count, tail);
         }
+        break;
+    }
+    case kTypeLog:
+        net->HandleLog(r, count, (type & kTypeFlagRightStick) != 0);
+        break;
+    case kTypeHave: {
+        const uint32_t have = r.U32();
+        if (!r.ok) break;
+        if (net->admit_mask && player == (uint8_t)__builtin_ctz(net->admit_mask) && have > net->admit_have) {
+            net->admit_have = have;
+            net->admit_progress_at = net->Now();
+        }
+        break;
+    }
+    case kTypeRejoin: {
+        const uint8_t mask = r.U8();
+        const uint32_t tick = r.U32();
+        if (!r.ok) break;
+        net->stats.packets_received++;
+        net->last_recv_usecs = net->Now();
+        net->ApplyRejoin(mask, tick);
         break;
     }
     case kTypeAway:
@@ -862,10 +1277,11 @@ int n64net_take_rollback(n64net_input *net, uint32_t *tick) {
 }
 
 uint32_t n64net_input_confirmed_tick(n64net_input *net) {
+    if (net->CatchingUp()) return net->log_end > net->cfg.start_tick ? net->log_end - 1 : kNoTick;
     uint32_t needed = net->MinNextNeeded();
     if (needed == kNoTick) needed = net->local_started ? net->local_last + 1 : net->cfg.start_tick;
     if (net->local_started) needed = std::min(needed, net->local_last + 1);
-    else needed = std::min(needed, net->cfg.start_tick);
+    else needed = std::min(needed, net->local_base);
     return needed == 0 ? kNoTick : needed - 1;
 }
 
@@ -885,7 +1301,7 @@ void n64net_input_set_auto_delay(n64net_input *net, uint32_t min_delay, uint32_t
 uint32_t n64net_input_get_delay(n64net_input *net) { return net->delay; }
 
 int n64net_timesync_should_skip(n64net_input *net) {
-    if (net->cfg.rollback_window == 0 || !net->remote_advantage_valid) return 0;
+    if (net->cfg.rollback_window == 0 || !net->remote_advantage_valid || net->CatchingUp()) return 0;
     // Twice the ticks we run ahead (our advantage minus the peer's), smoothed
     // over ~16 frames so jitter doesn't make both sides take turns.
     const int32_t ahead2 = net->LocalAdvantage() - net->remote_advantage;
@@ -996,8 +1412,8 @@ int n64net_rollback_resimulating(n64net_input *net) { return net->resimulating; 
 } // extern "C"
 
 int n64net_input_retire(n64net_input *net, int player, const void *action, uint32_t size, uint32_t *apply_tick) {
-    if (!net || player < 0 || player >= net->cfg.num_players || net->IsLocal(player) || net->retired[player] ||
-        size > N64NET_INPUT_MAX_EVENT) {
+    if (!net || player < 0 || player >= net->cfg.num_players || net->IsLocal(player) ||
+        (net->retired[player] && net->join_from[player] == kNoTick) || size > N64NET_INPUT_MAX_EVENT) {
         return 0;
     }
     // the last tick of this player everyone gets: what arrived here without a gap
@@ -1026,3 +1442,39 @@ int n64net_input_retired(n64net_input *net, int player, uint32_t *last_tick, uin
 }
 
 int n64net_input_remote_players(n64net_input *net) { return net ? (int)__builtin_popcount(net->remote_mask) : 0; }
+
+int n64net_input_admit(n64net_input *net, uint32_t player_mask) {
+    if (!net || net->cfg.joining) return 0;
+    if (player_mask == 0) {   // cancel (the joiner went away before its live tick was announced)
+        if (net->rejoin_tick == kNoTick || !net->admit_mask) net->admit_mask = 0;
+        return 1;
+    }
+    if (net->admit_mask) return 0;
+    for (int p = 0; p < net->cfg.num_players; p++) {
+        if ((player_mask & (1u << p)) && (!net->retired[p] || net->join_from[p] != kNoTick || net->IsLocal(p))) return 0;
+    }
+    if (player_mask >> net->cfg.num_players) return 0;
+    net->ExtendLog();
+    net->admit_mask = player_mask;
+    net->admit_have = net->admit_sent = net->cfg.start_tick;
+    net->admit_progress_at = net->Now();
+    net->rejoin_tick = kNoTick;
+    net->Log("n64net input: a machine joins as players %x: sending it the log (%u ticks so far)\n", player_mask,
+             net->log_end - net->cfg.start_tick);
+    net->ServeJoiner();
+    return 1;
+}
+
+int n64net_input_catching_up(n64net_input *net) { return net && net->CatchingUp() ? 1 : 0; }
+
+int n64net_input_rejoined(n64net_input *net, int player, uint32_t *tick) {
+    if (!net || player < 0 || player >= N64NET_INPUT_MAX_PLAYERS || net->join_from[player] == kNoTick) return 0;
+    if (tick) *tick = net->join_from[player];
+    return 1;
+}
+
+uint32_t n64net_input_log_ticks(n64net_input *net, uint32_t *live_tick) {
+    if (!net) return 0;
+    if (live_tick) *live_tick = net->cfg.joining ? net->live_from : net->rejoin_tick;
+    return net->log_end - net->cfg.start_tick;
+}

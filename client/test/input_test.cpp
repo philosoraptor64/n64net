@@ -47,7 +47,7 @@ struct Machine {
     uint32_t tick = 0;          // next tick to simulate
     bool sampled = false;       // set_local done for `tick`
     uint64_t state = 0;
-    uint64_t hist[kTicks + 64] = {};
+    uint64_t hist[4096] = {};
     uint64_t ring[kSlots] = {};
     int event_tick = -1;        // where it saw the host's event
     uint32_t rollbacks = 0;
@@ -57,20 +57,23 @@ int g_machines = 0;
 int g_players = 0;
 
 int g_silent = -1;   // a machine that left: nothing it sends arrives
+int g_gone = -1;     // a machine that left: nothing reaches it
+void SendToPlayer(void *user, int player, const uint8_t *data, uint32_t size);
 void SendFrom(void *user, const uint8_t *data, uint32_t size) {
     const int from = (int)(intptr_t)user;
     if (from == g_silent) return;
     for (int to = 0; to < g_machines; to++) {
-        if (to == from || Rand() % 100 < g_net.loss_pct) continue;
+        if (to == from || to == g_gone || Rand() % 100 < g_net.loss_pct) continue;
         const uint64_t at = g_now + g_net.latency_us + (g_net.jitter_us ? Rand() % g_net.jitter_us : 0);
         g_wire.push_back({ at, to, std::vector<uint8_t>(data, data + size) });
     }
 }
 
-// a player's controller: a function of (player, tick) only
-n64net_pad PadOf(int player, uint32_t tick) {
+// a player's controller: a function of (player, tick) only (for a joiner's player: another function, a
+// different person)
+n64net_pad PadOf(int player, uint32_t tick, uint32_t who = 0) {
     n64net_pad p = {};
-    uint32_t h = (uint32_t)player * 2654435761u ^ (tick / 7) * 40503u;
+    uint32_t h = ((uint32_t)player + who * 11u) * 2654435761u ^ (tick / 7) * 40503u;
     p.buttons = (uint16_t)(h & 0xF0F0);
     p.stick_x = (int8_t)(h >> 16);
     p.stick_y = (int8_t)(h >> 24);
@@ -92,9 +95,12 @@ void Step(Machine &m) {
         }
         // a player who left: from the agreed tick the game "changes" it (a CPU takes over)
         uint32_t last, apply, alen = sizeof(ev);
-        if (n64net_input_retired(m.net, p, &last, &apply, ev, &alen) && m.tick >= apply) {
+        uint32_t back = 0;
+        const bool rejoined = n64net_input_rejoined(m.net, p, &back) && m.tick >= back;
+        if (n64net_input_retired(m.net, p, &last, &apply, ev, &alen) && m.tick >= apply && !rejoined) {
             m.state = Mix(m.state, 77000u + ev[0] + 10u * p);
         }
+        if (rejoined && m.tick == back) m.state = Mix(m.state, 88000u + p);   // human again
     }
     m.hist[m.tick] = m.state;
     m.tick++;
@@ -285,6 +291,168 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     return ok && seen == machines;
 }
 
+void SendToPlayer(void *user, int player, const uint8_t *data, uint32_t size) {
+    const int from = (int)(intptr_t)user;
+    for (int to = 0; to < g_machines; to++) {
+        if (to == from || to == g_gone || !(g_m[to].mask & (1u << player)) || Rand() % 100 < g_net.loss_pct) continue;
+        const uint64_t at = g_now + g_net.latency_us + (g_net.jitter_us ? Rand() % g_net.jitter_us : 0);
+        g_wire.push_back({ at, to, std::vector<uint8_t>(data, data + size) });
+    }
+}
+
+// A machine leaves at tick leave_at; 300 ms later the host gives its players CPUs; at tick join_at (host) a new
+// machine joins in its place: the host admits it, it fast-forwards through the log (up to `ff` ticks per ms)
+// and takes the players over. Every machine, the joiner included, must hold the same state at every tick.
+bool RunJoin(const char *name, const uint32_t *masks, int machines, uint32_t window, uint32_t delay, Net net,
+             int leaver, uint32_t leave_at, uint32_t join_at, uint32_t ff, uint32_t ticks) {
+    g_now = 0;
+    g_rng = 999;
+    g_silent = g_gone = -1;
+    g_wire.clear();
+    g_net = net;
+    g_machines = machines;
+    g_players = 0;
+    for (int i = 0; i < machines; i++) {
+        for (int p = 0; p < 4; p++) if (masks[i] & (1u << p)) g_players = std::max(g_players, p + 1);
+    }
+    std::vector<uint64_t> hist[kMaxMachines];
+    auto make = [&](int i, bool joining) {
+        Machine &m = g_m[i];
+        m = Machine();
+        m.id = i;
+        m.mask = masks[i];
+        hist[i].assign(ticks + 64, 0);
+        n64net_input_config c = {};
+        c.num_players = g_players;
+        c.local_player = __builtin_ctz(masks[i]);
+        c.local_mask = masks[i];
+        c.session_id = 78;
+        c.input_delay = delay;
+        c.rollback_window = window;
+        c.ticks_per_second = 60;
+        c.send = SendFrom;
+        c.send_to = SendToPlayer;
+        c.user = (void *)(intptr_t)i;
+        c.now_usecs = Now;
+        c.joining = joining ? 1 : 0;
+        m.net = n64net_input_create(&c);
+        return m.net != nullptr;
+    };
+    for (int i = 0; i < machines; i++) if (!make(i, false)) return false;
+    bool left = false, retired = false, joined = false, admitted = false;
+    uint64_t left_us = 0;
+    uint64_t caught_up_us = 0, joined_us = 0;
+    const n64net_rollback_callbacks cb0 = { Save, Load, Advance, nullptr, kSlots };
+    auto step_tick = [&](Machine &m, int i) {
+        Step(m);
+        hist[i][m.tick - 1] = m.state;
+    };
+    for (uint64_t step = 0; step < 400000; step++) {
+        bool done = true;
+        for (int i = 0; i < machines; i++) done &= g_m[i].tick >= ticks || (i == leaver && left && !joined);
+        if (done) break;
+        g_now += 1000;
+        if (!left && g_m[leaver].tick >= leave_at) {
+            left = true;
+            left_us = g_now;
+            g_silent = g_gone = leaver;
+            n64net_input_destroy(g_m[leaver].net);
+            g_m[leaver].net = nullptr;
+        }
+        if (left && !retired && g_now > left_us + 300000) {
+            retired = true;
+            for (int p = 0; p < 4; p++) {
+                if (!(masks[leaver] & (1u << p))) continue;
+                const uint8_t act[2] = { 'C', (uint8_t)p };
+                if (!n64net_input_retire(g_m[0].net, p, act, sizeof(act), nullptr)) { printf("%s: retire refused\n", name); return false; }
+            }
+        }
+        if (retired && !joined && g_m[0].tick >= join_at) {
+            joined = true;
+            joined_us = g_now;
+            g_silent = g_gone = -1;
+            if (!make(leaver, true)) return false;
+        }
+        if (joined && !admitted && g_now > joined_us + 50000) {   // the host accepts it 50 ms later
+            admitted = true;
+            if (!n64net_input_admit(g_m[0].net, masks[leaver])) { printf("%s: admit refused\n", name); return false; }
+        }
+        for (auto it = g_wire.begin(); it != g_wire.end();) {
+            if (it->to == g_gone || !g_m[it->to].net) { it = g_wire.erase(it); continue; }
+            if (it->at <= g_now) {
+                n64net_input_handle_packet(g_m[it->to].net, it->data.data(), (uint32_t)it->data.size());
+                it = g_wire.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (int i = 0; i < machines; i++) {
+            Machine &m = g_m[i];
+            if (!m.net) continue;
+            const bool ffwd = n64net_input_catching_up(m.net) != 0;
+            if (!ffwd && caught_up_us == 0 && i == leaver && joined) caught_up_us = g_now;
+            for (uint32_t k = 0; k < (ffwd ? ff : 1u); k++) {
+                if (m.tick >= ticks) break;
+                if (!ffwd && g_now < (uint64_t)m.tick * 16667 + (uint64_t)i * 3000) break;
+                if (!m.sampled) {
+                    n64net_rollback_callbacks cb = cb0;
+                    cb.user = &m;
+                    if (window > 0) n64net_rollback_frame(m.net, m.tick, &cb);
+                    n64net_pad pads[N64NET_INPUT_MAX_PLAYERS] = {};
+                    for (int p = 0; p < 4; p++) if (m.mask & (1u << p)) pads[p] = PadOf(p, m.tick, i == leaver && joined ? 5 : 0);
+                    n64net_input_set_local_pads(m.net, m.tick, pads);
+                    m.sampled = true;
+                }
+                if (!n64net_input_ready(m.net, m.tick)) {
+                    n64net_input_resend(m.net);
+                    break;
+                }
+                step_tick(m, i);
+                m.sampled = false;
+            }
+        }
+    }
+    // late inputs, then a last rollback pass
+    for (int round = 0; round < 50 && !g_wire.empty(); round++) {
+        g_now += 100000;
+        for (auto &pk : g_wire) if (g_m[pk.to].net) n64net_input_handle_packet(g_m[pk.to].net, pk.data.data(), (uint32_t)pk.data.size());
+        g_wire.clear();
+        for (int i = 0; i < machines; i++) if (g_m[i].net) n64net_input_resend(g_m[i].net);
+    }
+    for (int i = 0; i < machines; i++) {
+        Machine &m = g_m[i];
+        if (!m.net || window == 0) continue;
+        n64net_rollback_callbacks cb = cb0;
+        cb.user = &m;
+        // a rollback rewrites hist via Advance -> Step; keep hist in step with m.hist
+        n64net_rollback_frame(m.net, m.tick, &cb);
+    }
+    uint32_t confirmed = ticks;
+    for (int i = 0; i < machines; i++) {
+        uint32_t c = n64net_input_confirmed_tick(g_m[i].net);
+        if (c == UINT32_MAX) c = 0;
+        confirmed = std::min(confirmed, std::min(c, g_m[i].tick - 1));
+    }
+    bool ok = joined && admitted && confirmed > ticks - 60;
+    uint32_t first_bad = UINT32_MAX;
+    for (uint32_t t = 0; t <= confirmed && ok; t++) {
+        for (int i = 1; i < machines; i++) {
+            if (g_m[i].hist[t] != g_m[0].hist[t]) { first_bad = t; ok = false; break; }
+        }
+    }
+    uint32_t back[kMaxMachines] = {};
+    for (int i = 0; i < machines; i++) {
+        if (!n64net_input_rejoined(g_m[i].net, __builtin_ctz(masks[leaver]), &back[i])) ok = false;
+        if (back[i] != back[0]) ok = false;
+    }
+    printf("%-44s %s: %u ticks compared%s, players back from tick %u, caught up in %.0f ms\n", name, ok ? "PASS" : "FAIL",
+           confirmed + 1, first_bad != UINT32_MAX ? " (DIFFERENT STATES)" : "", back[0],
+           caught_up_us ? (caught_up_us - joined_us) / 1000.0 : -1.0);
+    if (first_bad != UINT32_MAX) printf("   first difference at tick %u\n", first_bad);
+    for (int i = 0; i < machines; i++) n64net_input_destroy(g_m[i].net);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -305,6 +473,11 @@ int main() {
     all &= Run("3 machines, one leaves; host gives its 2 players CPUs", three_2local, 3, 8, 2, bad, 200, -1, 1, 600);
     all &= Run("4 machines, lockstep, one leaves", four, 4, 0, 3, bad, 200, -1, 3, 500);
     all &= Run("2 machines, guest leaves (host plays on alone)", two, 2, 8, 2, bad, 200, -1, 1, 700);
+    // joining mid-game
+    all &= RunJoin("join: 2 machines, lockstep", two, 2, 0, 2, clean, 1, 300, 700, 20, 1400);
+    all &= RunJoin("join: 3 machines, rollback, bad network", three_2local, 3, 8, 2, bad, 2, 300, 900, 20, 1600);
+    all &= RunJoin("join: 3 machines, the joiner has 2 players", three_2local, 3, 8, 2, bad, 1, 400, 1000, 10, 1800);
+    all &= RunJoin("join: 4 machines, rollback, cellular", four, 4, 8, 3, cell, 3, 500, 1100, 8, 1800);
     printf("%s\n", all ? "ALL PASS" : "SOME FAILED");
     return all ? 0 : 1;
 }

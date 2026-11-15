@@ -74,6 +74,12 @@ typedef struct n64net_input_config {
                                   Must include local_player. Each local player's inputs travel in
                                   their own packets (the same format), so other machines need no
                                   notice of how players are spread over devices beyond remote_mask. */
+    int joining;               /* 1: this machine joins a match already running (its players are retired
+                                  there: CPUs or idle). Every tick up to the one its players go live at
+                                  comes from the host's input log (see "Joining a running match") */
+    void (*send_to)(void *user, int player, const uint8_t *data, uint32_t size);
+                               /* optional: send to the machine of `player` only (the input log for a
+                                  joiner is big); without it the log goes to every machine (others drop it) */
 } n64net_input_config;
 
 n64net_input *n64net_input_create(const n64net_input_config *config);
@@ -121,11 +127,36 @@ uint32_t n64net_input_get_event(n64net_input *net, int player, uint32_t tick, vo
  * a machine that already simulated past either point gets a rollback request.
  * Each machine's game asks n64net_input_retired() every tick and makes the change
  * when it plays tick `apply_tick` (also in a resimulation: it is game state).
- * Returns 1 (and the apply tick), 0 if the player isn't remote or already left. */
+ * Returns 1 (and the apply tick), 0 if the player isn't remote or already left (a player a joiner took
+ * over may leave again). */
 int n64net_input_retire(n64net_input *net, int player, const void *action, uint32_t size, uint32_t *apply_tick);
 /* 1 if `player` left (any machine), with the agreed ticks and the action. *size: in = cap, out = length. */
 int n64net_input_retired(n64net_input *net, int player, uint32_t *last_tick, uint32_t *apply_tick, void *action,
                          uint32_t *size);
+/* --- Joining a running match -------------------------------------------------
+ * Every machine keeps the confirmed inputs of the whole match (the log: a few MB an hour). A machine
+ * joining mid-game takes over retired players (a CPU or an idle player since their machine left):
+ *  - The host calls n64net_input_admit(net, mask) with those players (the joiner's local_mask). It
+ *    streams the log to the joiner (config.send_to), and when the joiner is almost caught up, picks a
+ *    tick a couple of seconds ahead from which the players are live again and announces it to every
+ *    machine.
+ *  - The joiner starts the game the same way as everyone did (seed, settings) with config.joining = 1
+ *    and fast-forwards: while n64net_input_catching_up() it runs every tick that
+ *    n64net_input_ready() allows, as fast as it can, without pacing (no drawing or sound needed). Its
+ *    inputs before the live tick are ignored (set_local may be called as usual).
+ *  - Every machine's game asks n64net_input_rejoined() each tick and makes the players human again at
+ *    that tick (the reverse of the retirement's change; also in a resimulation). Until then the
+ *    players stay what the retirement made them, also on the joiner while it catches up.
+ * Returns 1, or 0 if a player in mask isn't retired, a join is already under way, or this is the joiner. */
+int n64net_input_admit(n64net_input *net, uint32_t player_mask);
+/* The joiner: 1 until it has played up to the tick its players go live at (fast-forward). */
+int n64net_input_catching_up(n64net_input *net);
+/* 1 if `player` is human again (a joiner took it over) from *tick on. */
+int n64net_input_rejoined(n64net_input *net, int player, uint32_t *tick);
+/* Ticks in this machine's input log (the joiner: how much of the host's log has arrived) and the live tick
+   once it is known (else UINT32_MAX): for a "catching up" progress display. */
+uint32_t n64net_input_log_ticks(n64net_input *net, uint32_t *live_tick);
+
 /* Remote players still taking part. */
 int n64net_input_remote_players(n64net_input *net);
 
