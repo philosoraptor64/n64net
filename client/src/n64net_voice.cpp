@@ -6,7 +6,10 @@
  * socket is only ever used from one thread.
  * Playback: mixed into the game's own audio output (n64net_voice_mix), since
  * some platforms (iOS) allow only one output device. Received packets go into
- * a small jitter buffer indexed by sequence number; the mixer starts once
+ * a small jitter buffer indexed by sequence number (one per sending machine, up
+ * to 4: each has its own buffer, decoder and resampler, and the mixer adds
+ * them up; the caller says who sent a packet: n64net_voice_handle_packet_from);
+ * the mixer starts once
  * ~60 ms is buffered, decodes in order, conceals a lost frame (FEC from the
  * next packet, else Opus PLC), skips ahead if the buffer grows past ~240 ms,
  * and resamples 48 kHz to the game's rate (linear). */
@@ -70,7 +73,7 @@ struct Packet {
     uint8_t data[N64NET_VOICE_MAX_PACKET];
 };
 
-std::mutex sLock;  // guards sSlots/sHighest/sHaveAny and sOutgoing
+std::mutex sLock;  // guards the streams' jitter buffers and sOutgoing
 // Guards the mixer (decoder, jitter and resampler state): n64net_voice_mix
 // may run on the game's audio thread (or two threads, e.g. a stall
 // keep-alive), while start/stop run on the game thread. Lock order: sMixLock,
@@ -80,7 +83,6 @@ std::atomic<bool> sRunning{false};
 n64net_voice_config sConfig = {};
 SDL_AudioDeviceID sCaptureDev = 0;
 OpusEncoder *sEncoder = nullptr;
-OpusDecoder *sDecoder = nullptr;  // mixer only
 
 // capture side (capture callback, or the pump in tone mode)
 int16_t sCapBuf[kFrame];
@@ -91,16 +93,22 @@ std::chrono::steady_clock::time_point sToneClock;
 uint64_t sToneFrames = 0;
 std::deque<Packet> sOutgoing;
 
-// playback side
-Slot sSlots[kSlots];
-uint16_t sHighest = 0;
-bool sHaveAny = false;
-uint16_t sNextSeq = 0;  // mixer only
-bool sPlaying = false;  // mixer only
-int16_t sPcm[kFrame];
-int sPcmPos = kFrame;
-float sResPrev = 0.0f, sResCur = 0.0f;  // resampler: two 48 kHz samples
-double sResPhase = 0.0;
+// playback side: one stream per sending machine
+constexpr int kStreams = N64NET_VOICE_MAX_SENDERS;
+struct Stream {
+    Slot slots[kSlots];         // sLock
+    uint16_t highest = 0;       // sLock
+    bool haveAny = false;       // sLock
+    uint16_t nextSeq = 0;       // sLock (the mixer writes it under it)
+    bool playing = false;       // sLock
+    OpusDecoder *decoder = nullptr;  // mixer only
+    int16_t pcm[kFrame] = {};
+    int pcmPos = kFrame;
+    float resPrev = 0.0f, resCur = 0.0f;  // resampler: two 48 kHz samples
+    double resPhase = 0.0;
+    std::atomic<int64_t> speakUntilMs{0};
+};
+Stream sStreams[kStreams];
 constexpr float kVoiceGain = 1.4f;
 // Send side: speech is levelled before encoding (quiet talking at arm's
 // length comes out like a raised voice). Receive side: the game's audio dips
@@ -267,79 +275,80 @@ void GenerateToneFrames() {
     }
 }
 
-// Mixer: the next 20 ms of the other player's voice.
-void DecodeNext() {
+// Mixer: the next 20 ms of one sender's voice.
+void DecodeNext(Stream &st) {
     Slot cur, next;
     bool have = false, haveNext = false;
     {
         std::lock_guard<std::mutex> lock(sLock);
-        int buffered = sHaveAny ? static_cast<int16_t>(sHighest - sNextSeq) + 1 : 0;
-        if (!sPlaying) {
+        int buffered = st.haveAny ? static_cast<int16_t>(st.highest - st.nextSeq) + 1 : 0;
+        if (!st.playing) {
             if (buffered < kStartFrames) {
-                std::memset(sPcm, 0, sizeof(sPcm));
+                std::memset(st.pcm, 0, sizeof(st.pcm));
                 return;
             }
-            sPlaying = true;
+            st.playing = true;
         }
         if (buffered > kMaxBuffered) {
-            sNextSeq = static_cast<uint16_t>(sHighest - kStartFrames + 1);  // far behind (a long stall)
+            st.nextSeq = static_cast<uint16_t>(st.highest - kStartFrames + 1);  // far behind (a long stall)
             sSkips++;
         } else if (buffered > kTrimBuffered) {
             // A little behind (the game's audio paused for a moment): drop
             // the oldest frame, preferring silence (DTX) frames.
-            Slot &old = sSlots[sNextSeq % kSlots];
-            if (!old.full || old.seq != sNextSeq || old.len <= 3 || buffered > kTrimBuffered + 4) {
+            Slot &old = st.slots[st.nextSeq % kSlots];
+            if (!old.full || old.seq != st.nextSeq || old.len <= 3 || buffered > kTrimBuffered + 4) {
                 old.full = false;
-                sNextSeq++;
+                st.nextSeq++;
                 sTrims++;
             }
         } else if (buffered <= 0) {
-            sPlaying = false;  // ran dry: rebuffer
+            st.playing = false;  // ran dry: rebuffer
             sUnderruns++;
-            std::memset(sPcm, 0, sizeof(sPcm));
+            std::memset(st.pcm, 0, sizeof(st.pcm));
             return;
         }
-        Slot &s = sSlots[sNextSeq % kSlots];
-        if (s.full && s.seq == sNextSeq) {
+        Slot &s = st.slots[st.nextSeq % kSlots];
+        if (s.full && s.seq == st.nextSeq) {
             cur = s;
             have = true;
             s.full = false;
         } else {
-            Slot &n = sSlots[(sNextSeq + 1) % kSlots];
-            if (n.full && n.seq == static_cast<uint16_t>(sNextSeq + 1)) {
+            Slot &n = st.slots[(st.nextSeq + 1) % kSlots];
+            if (n.full && n.seq == static_cast<uint16_t>(st.nextSeq + 1)) {
                 next = n;
                 haveNext = true;
             }
         }
-        sNextSeq++;
+        st.nextSeq++;
     }
     int n;
     if (have) {
-        n = opus_decode(sDecoder, cur.data, cur.len, sPcm, kFrame, 0);
+        n = opus_decode(st.decoder, cur.data, cur.len, st.pcm, kFrame, 0);
     } else {
         sLost++;
         if (haveNext) {
             sFec++;
-            n = opus_decode(sDecoder, next.data, next.len, sPcm, kFrame, 1);  // in-band FEC
+            n = opus_decode(st.decoder, next.data, next.len, st.pcm, kFrame, 1);  // in-band FEC
         } else {
-            n = opus_decode(sDecoder, nullptr, 0, sPcm, kFrame, 0);  // concealment
+            n = opus_decode(st.decoder, nullptr, 0, st.pcm, kFrame, 0);  // concealment
         }
     }
     if (n != kFrame) {
-        std::memset(sPcm, 0, sizeof(sPcm));
+        std::memset(st.pcm, 0, sizeof(st.pcm));
     }
-    if (Rms(sPcm, kFrame) > kSpeakingRms) {
+    if (Rms(st.pcm, kFrame) > kSpeakingRms) {
         sRemoteSpeakUntilMs = NowMs() + 250;
+        st.speakUntilMs = NowMs() + 250;
         sAudibleFrames++;
     }
 }
 
-float Pull48k() {
-    if (sPcmPos == kFrame) {
-        DecodeNext();
-        sPcmPos = 0;
+float Pull48k(Stream &st) {
+    if (st.pcmPos == kFrame) {
+        DecodeNext(st);
+        st.pcmPos = 0;
     }
-    return static_cast<float>(sPcm[sPcmPos++]);
+    return static_cast<float>(st.pcm[st.pcmPos++]);
 }
 
 SDL_AudioDeviceID OpenMicrophone() {
@@ -378,10 +387,17 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
     }
     int err = 0;
     sEncoder = opus_encoder_create(kRate, 1, OPUS_APPLICATION_VOIP, &err);
-    OpusDecoder *decoder = opus_decoder_create(kRate, 1, &err);
-    if (sEncoder == nullptr || decoder == nullptr) {
+    OpusDecoder *decoders[kStreams] = {};
+    bool ok = sEncoder != nullptr;
+    for (int i = 0; i < kStreams; i++) {
+        decoders[i] = opus_decoder_create(kRate, 1, &err);
+        ok = ok && decoders[i] != nullptr;
+    }
+    if (!ok) {
         Log("n64net voice: Opus setup failed\n");
-        if (decoder != nullptr) opus_decoder_destroy(decoder);
+        for (OpusDecoder *d : decoders) {
+            if (d != nullptr) opus_decoder_destroy(d);
+        }
         n64net_voice_stop();
         return;
     }
@@ -392,21 +408,23 @@ extern "C" void n64net_voice_start(const n64net_voice_config *config) {
     opus_encoder_ctl(sEncoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
 
     {
-        std::lock_guard<std::mutex> lock(sLock);
-        for (Slot &s : sSlots) {
-            s.full = false;
-        }
-        sHaveAny = false;
-        sOutgoing.clear();
-    }
-    {
         std::lock_guard<std::mutex> mix(sMixLock);
-        sDecoder = decoder;
-        sPlaying = false;
+        std::lock_guard<std::mutex> lock(sLock);
+        for (int i = 0; i < kStreams; i++) {
+            Stream &st = sStreams[i];
+            for (Slot &sl : st.slots) {
+                sl.full = false;
+            }
+            st.haveAny = false;
+            st.playing = false;
+            st.decoder = decoders[i];
+            st.pcmPos = kFrame;
+            st.resPrev = st.resCur = 0.0f;
+            st.resPhase = 0.0;
+            st.speakUntilMs = 0;
+        }
+        sOutgoing.clear();
         sDucker.Reset();
-        sPcmPos = kFrame;
-        sResPrev = sResCur = 0.0f;
-        sResPhase = 0.0;
     }
     sCapFill = 0;
     sSendSeq = 0;
@@ -501,9 +519,11 @@ extern "C" void n64net_voice_stop(void) {
     {
         std::lock_guard<std::mutex> mix(sMixLock);  // waits for a mix in progress (audio thread)
         was_running = sRunning.exchange(false);
-        if (sDecoder != nullptr) {
-            opus_decoder_destroy(sDecoder);
-            sDecoder = nullptr;
+        for (Stream &st : sStreams) {
+            if (st.decoder != nullptr) {
+                opus_decoder_destroy(st.decoder);
+                st.decoder = nullptr;
+            }
         }
     }
     if (was_running) {
@@ -517,19 +537,30 @@ extern "C" void n64net_voice_stop(void) {
 
 extern "C" void n64net_voice_mix(int16_t *stereo, int frames, int rate) {
     std::lock_guard<std::mutex> mix(sMixLock);
-    if (!sRunning || sDecoder == nullptr || stereo == nullptr || rate <= 0) {
+    if (!sRunning || sStreams[0].decoder == nullptr || stereo == nullptr || rate <= 0) {
         return;
+    }
+    // the senders heard so far (a stream that never received anything stays silent and costs nothing)
+    bool active[kStreams];
+    {
+        std::lock_guard<std::mutex> lock(sLock);
+        for (int k = 0; k < kStreams; k++) active[k] = sStreams[k].haveAny;
     }
     const double step = static_cast<double>(kRate) / rate;
     const bool talking = sDuckOn && NowMs() < sRemoteSpeakUntilMs.load();
     for (int i = 0; i < frames; i++) {
         const float duck = sDucker.Next(talking, rate);
-        float v = (sResPrev + (sResCur - sResPrev) * static_cast<float>(sResPhase)) * kVoiceGain;
-        sResPhase += step;
-        while (sResPhase >= 1.0) {
-            sResPhase -= 1.0;
-            sResPrev = sResCur;
-            sResCur = Pull48k();
+        float v = 0.0f;
+        for (int k = 0; k < kStreams; k++) {
+            if (!active[k]) continue;
+            Stream &st = sStreams[k];
+            v += (st.resPrev + (st.resCur - st.resPrev) * static_cast<float>(st.resPhase)) * kVoiceGain;
+            st.resPhase += step;
+            while (st.resPhase >= 1.0) {
+                st.resPhase -= 1.0;
+                st.resPrev = st.resCur;
+                st.resCur = Pull48k(st);
+            }
         }
         for (int ch = 0; ch < 2; ch++) {
             int s = static_cast<int>(stereo[i * 2 + ch] * duck) + static_cast<int>(v);
@@ -604,6 +635,10 @@ extern "C" void n64net_voice_pump(n64net_voice_send_fn send) {
 }
 
 extern "C" int n64net_voice_handle_packet(const uint8_t *data, int32_t size) {
+    return n64net_voice_handle_packet_from(data, size, 0);
+}
+
+extern "C" int n64net_voice_handle_packet_from(const uint8_t *data, int32_t size, int sender) {
     if (size < kHeader || data[0] != ((N64NET_VOICE_MAGIC >> 24) & 0xFF) ||
         data[1] != ((N64NET_VOICE_MAGIC >> 16) & 0xFF) || data[2] != ((N64NET_VOICE_MAGIC >> 8) & 0xFF) ||
         data[3] != (N64NET_VOICE_MAGIC & 0xFF)) {
@@ -612,21 +647,25 @@ extern "C" int n64net_voice_handle_packet(const uint8_t *data, int32_t size) {
     if (!sRunning || size > N64NET_VOICE_MAX_PACKET) {
         return 1;  // voice, but we're not playing it
     }
+    if (sender < 0 || sender >= kStreams) {
+        return 1;
+    }
+    Stream &st = sStreams[sender];
     uint16_t seq = static_cast<uint16_t>((data[4] << 8) | data[5]);
     std::lock_guard<std::mutex> lock(sLock);
-    if (sHaveAny && sPlaying && static_cast<int16_t>(seq - sNextSeq) < 0) {
+    if (st.haveAny && st.playing && static_cast<int16_t>(seq - st.nextSeq) < 0) {
         sLate++;  // its turn has passed
         return 1;
     }
-    if (!sHaveAny || static_cast<int16_t>(seq - sHighest) > 0) {
-        if (!sHaveAny || static_cast<int16_t>(seq - sHighest) > kSlots / 2) {
-            sNextSeq = seq;  // first packet, or the sender restarted
-            sPlaying = false;
+    if (!st.haveAny || static_cast<int16_t>(seq - st.highest) > 0) {
+        if (!st.haveAny || static_cast<int16_t>(seq - st.highest) > kSlots / 2) {
+            st.nextSeq = seq;  // first packet, or the sender restarted
+            st.playing = false;
         }
-        sHighest = seq;
-        sHaveAny = true;
+        st.highest = seq;
+        st.haveAny = true;
     }
-    Slot &s = sSlots[seq % kSlots];
+    Slot &s = st.slots[seq % kSlots];
     s.full = true;
     s.seq = seq;
     s.len = static_cast<uint8_t>(size - kHeader);
@@ -649,6 +688,10 @@ extern "C" int n64net_voice_is_push_to_talk(void) {
 }
 extern "C" int n64net_voice_remote_speaking(void) {
     return (sRunning && NowMs() < sRemoteSpeakUntilMs.load()) ? 1 : 0;
+}
+extern "C" int n64net_voice_remote_speaking_from(int sender) {
+    if (sender < 0 || sender >= kStreams) return 0;
+    return (sRunning && NowMs() < sStreams[sender].speakUntilMs.load()) ? 1 : 0;
 }
 extern "C" int n64net_voice_local_speaking(void) {
     return (sRunning && Transmitting() && NowMs() < sLocalSpeakUntilMs.load()) ? 1 : 0;

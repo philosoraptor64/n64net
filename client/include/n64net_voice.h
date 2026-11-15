@@ -17,6 +17,7 @@ extern "C" {
 
 #define N64NET_VOICE_MAGIC 0x4E363456u
 #define N64NET_VOICE_MAX_PACKET 112
+#define N64NET_VOICE_MAX_SENDERS 4   /* machines whose voices are mixed (n64net_voice_handle_packet_from) */
 
 typedef struct {
     int enabled;         /* 0: never opens the microphone */
@@ -55,8 +56,13 @@ void n64net_voice_output_write(const int16_t *stereo, int frames, int rate);
 int n64net_voice_output_buffered(int rate);
 /* Call often (every game tick, and while waiting): sends captured frames. */
 void n64net_voice_pump(n64net_voice_send_fn send);
-/* Returns 1 if `data` was a voice packet (consumed), else 0. */
+/* Returns 1 if `data` was a voice packet (consumed), else 0. Every sender
+ * (0..N64NET_VOICE_MAX_SENDERS-1, e.g. i64's machine index) has its own jitter
+ * buffer and decoder, and the mixer adds the voices up; the packets don't say
+ * who sent them, so the caller does. n64net_voice_handle_packet = sender 0
+ * (two-player sessions). */
 int n64net_voice_handle_packet(const uint8_t *data, int32_t size);
+int n64net_voice_handle_packet_from(const uint8_t *data, int32_t size, int sender);
 
 /* Open-mic mode: mute stops sending. Push-to-talk: talking sends. */
 void n64net_voice_set_muted(int muted);
@@ -65,6 +71,8 @@ void n64net_voice_set_talking(int talking);
 int n64net_voice_is_push_to_talk(void);
 /* 1 while the other player's voice is audible (for a speaking indicator). */
 int n64net_voice_remote_speaking(void);
+/* 1 while that sender's voice is audible. */
+int n64net_voice_remote_speaking_from(int sender);
 /* 1 while this machine is sending speech. */
 int n64net_voice_local_speaking(void);
 
