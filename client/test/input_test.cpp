@@ -50,6 +50,7 @@ struct Machine {
     uint64_t hist[kTicks + 64] = {};
     uint64_t ring[kSlots] = {};
     int event_tick = -1;        // where it saw the host's event
+    bool gone = false;          // left mid-game (test of drop-outs)
     uint32_t rollbacks = 0;
 };
 Machine g_m[kMaxMachines];
@@ -58,8 +59,9 @@ int g_players = 0;
 
 void SendFrom(void *user, const uint8_t *data, uint32_t size) {
     const int from = (int)(intptr_t)user;
+    if (g_m[from].gone) return;
     for (int to = 0; to < g_machines; to++) {
-        if (to == from || Rand() % 100 < g_net.loss_pct) continue;
+        if (to == from || g_m[to].gone || Rand() % 100 < g_net.loss_pct) continue;
         const uint64_t at = g_now + g_net.latency_us + (g_net.jitter_us ? Rand() % g_net.jitter_us : 0);
         g_wire.push_back({ at, to, std::vector<uint8_t>(data, data + size) });
     }
@@ -103,7 +105,7 @@ void Load(void *user, uint32_t slot) {
 void Advance(void *user) { Step(*(Machine *)user); }
 
 bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window, uint32_t delay, Net net,
-         uint32_t event_at, int bad_machine = -1) {
+         uint32_t event_at, int bad_machine = -1, int leaver = -1, uint32_t leave_tick = 0) {
     g_now = 0;
     g_rng = 12345;
     g_wire.clear();
@@ -136,20 +138,33 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     const n64net_rollback_callbacks cb0 = { Save, Load, Advance, nullptr, kSlots };
     for (uint64_t step = 0; step < 200000; step++) {
         bool done = true;
-        for (int i = 0; i < machines; i++) done &= g_m[i].tick >= kTicks;
+        for (int i = 0; i < machines; i++) done &= g_m[i].gone || g_m[i].tick >= kTicks;
         if (done) break;
         g_now += 1000;   // 1 ms per step; machines run a tick when 16.7 ms passed and they may
         // deliver
         for (auto it = g_wire.begin(); it != g_wire.end();) {
             if (it->at <= g_now) {
-                n64net_input_handle_packet(g_m[it->to].net, it->data.data(), (uint32_t)it->data.size());
+                if (!g_m[it->to].gone) n64net_input_handle_packet(g_m[it->to].net, it->data.data(), (uint32_t)it->data.size());
                 it = g_wire.erase(it);
             } else {
                 ++it;
             }
         }
+        // the leaver vanishes; half a second later the host announces the drop of each of its players
+        static uint64_t gone_at = 0;
+        if (step == 0) gone_at = 0;
+        if (leaver >= 0 && !g_m[leaver].gone && g_m[leaver].tick >= leave_tick) {
+            g_m[leaver].gone = true;
+            gone_at = g_now;
+        }
+        if (leaver >= 0 && gone_at && g_now == gone_at + 500000) {
+            for (int p = 0; p < 4; p++) {
+                if (g_m[leaver].mask & (1u << p)) n64net_input_announce_drop(g_m[0].net, p, n64net_input_player_next(g_m[0].net, p));
+            }
+        }
         for (int i = 0; i < machines; i++) {
             Machine &m = g_m[i];
+            if (m.gone) continue;
             if (m.tick >= kTicks || g_now < (uint64_t)m.tick * 16667 + (uint64_t)i * 3000) continue;
             if (!m.sampled) {
                 n64net_rollback_callbacks cb = cb0;
@@ -175,12 +190,14 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     // a final rollback pass: every machine resimulates whatever late inputs arrived
     for (int round = 0; round < 50 && !g_wire.empty(); round++) {
         g_now += 100000;
-        for (auto &pk : g_wire) n64net_input_handle_packet(g_m[pk.to].net, pk.data.data(), (uint32_t)pk.data.size());
+        auto wire = g_wire;
         g_wire.clear();
-        for (int i = 0; i < machines; i++) n64net_input_resend(g_m[i].net);
+        for (auto &pk : wire) if (!g_m[pk.to].gone) n64net_input_handle_packet(g_m[pk.to].net, pk.data.data(), (uint32_t)pk.data.size());
+        for (int i = 0; i < machines; i++) if (!g_m[i].gone) n64net_input_resend(g_m[i].net);
     }
     for (int i = 0; i < machines; i++) {
         Machine &m = g_m[i];
+        if (m.gone) continue;
         if (window > 0) {
             n64net_rollback_callbacks cb = cb0;
             cb.user = &m;
@@ -189,7 +206,10 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     }
     // compare: every tick confirmed everywhere must hold the same state on every machine
     uint32_t confirmed = kTicks;
+    int first = 0;
+    while (g_m[first].gone) first++;
     for (int i = 0; i < machines; i++) {
+        if (g_m[i].gone) continue;
         uint32_t c = n64net_input_confirmed_tick(g_m[i].net);
         if (c == UINT32_MAX) c = 0;
         confirmed = std::min(confirmed, std::min(c, g_m[i].tick - 1));
@@ -197,8 +217,9 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     bool ok = confirmed > kTicks / 2;
     uint32_t first_bad = UINT32_MAX;
     for (uint32_t t = 0; t <= confirmed && ok; t++) {
-        for (int i = 1; i < machines; i++) {
-            if (g_m[i].hist[t] != g_m[0].hist[t]) { first_bad = t; ok = false; break; }
+        for (int i = 0; i < machines; i++) {
+            if (g_m[i].gone) continue;
+            if (g_m[i].hist[t] != g_m[first].hist[t]) { first_bad = t; ok = false; break; }
         }
     }
     // the event: its state change happened at the same tick everywhere (states equal => yes); check it
@@ -206,32 +227,38 @@ bool Run(const char *name, const uint32_t *masks, int machines, uint32_t window,
     // that has no event is overkill here; instead check event visibility on each machine at event tick + delay
     int seen = 0;
     for (int i = 0; i < machines; i++) {
+        if (g_m[i].gone) continue;
         uint8_t ev[N64NET_INPUT_MAX_EVENT];
         if (n64net_input_get_event(g_m[i].net, 0, event_at + delay, ev, sizeof(ev)) == 3 && ev[2] == 3) seen++;
     }
+    int alive = 0;
+    for (int i = 0; i < machines; i++) alive += g_m[i].gone ? 0 : 1;
     // sync checks every 60 confirmed ticks: every machine must see a wrong hash from any other machine
     // (bad_machine reports wrong ones), and none may see a desync when all agree
     for (uint32_t t = 60; t <= confirmed; t += 60) {
         for (int i = 0; i < machines; i++) {
+            if (g_m[i].gone) continue;
             const uint32_t h = (uint32_t)g_m[i].hist[t] ^ (i == bad_machine ? 0x5A5Au : 0u);
             n64net_sync_record(g_m[i].net, t, 1, h);
         }
-        for (auto &pk : g_wire) n64net_input_handle_packet(g_m[pk.to].net, pk.data.data(), (uint32_t)pk.data.size());
+        for (auto &pk : g_wire) {
+            if (!g_m[pk.to].gone) n64net_input_handle_packet(g_m[pk.to].net, pk.data.data(), (uint32_t)pk.data.size());
+        }
         g_wire.clear();
     }
     int detected = 0;
-    for (int i = 0; i < machines; i++) detected += n64net_sync_desynced(g_m[i].net, nullptr, nullptr);
-    const bool sync_ok = bad_machine < 0 ? detected == 0 : detected == machines;
+    for (int i = 0; i < machines; i++) detected += g_m[i].gone ? 0 : n64net_sync_desynced(g_m[i].net, nullptr, nullptr);
+    const bool sync_ok = bad_machine < 0 ? detected == 0 : detected == alive;
     if (!sync_ok) printf("%s: sync check: %d of %d machines saw a desync (expected %d)\n", name, detected, machines,
                          bad_machine < 0 ? 0 : machines);
     ok = ok && sync_ok;
     uint32_t rb = 0;
     n64net_input_stats st;
     for (int i = 0; i < machines; i++) { n64net_input_get_stats(g_m[i].net, &st); rb += st.rollbacks; }
-    printf("%-44s %s: %u ticks compared%s, event seen by %d/%d, rollbacks %u\n", name, ok && seen == machines ? "PASS" : "FAIL",
-           confirmed + 1, first_bad != UINT32_MAX ? " (first difference at a tick)" : "", seen, machines, rb);
+    printf("%-50s %s: %u ticks compared%s, event seen by %d/%d, rollbacks %u\n", name, ok && seen == alive ? "PASS" : "FAIL",
+           confirmed + 1, first_bad != UINT32_MAX ? " (first difference at a tick)" : "", seen, alive, rb);
     for (int i = 0; i < machines; i++) n64net_input_destroy(g_m[i].net);
-    return ok && seen == machines;
+    return ok && seen == alive;
 }
 
 } // namespace
@@ -251,6 +278,9 @@ int main() {
     all &= Run("3 players on one machine + 1, rollback", one_device_two_machines, 2, 8, 2, bad, 400);
     all &= Run("4 machines, the last one desyncs (all must notice)", four, 4, 8, 2, bad, 300, 3);
     all &= Run("3 machines, the middle one desyncs", three_2local, 3, 8, 2, bad, 300, 1);
+    all &= Run("3 machines, one leaves at 600 (rollback)", three_2local, 3, 8, 2, bad, 900, -1, 2, 600);
+    all &= Run("4 machines, one leaves at 500 (rollback, cellular)", four, 4, 8, 3, cell, 900, -1, 3, 500);
+    all &= Run("3 machines, the 2-player one leaves (lockstep)", three_2local, 3, 0, 3, bad, 900, -1, 1, 450);
     printf("%s\n", all ? "ALL PASS" : "SOME FAILED");
     return all ? 0 : 1;
 }

@@ -109,6 +109,17 @@ int n64net_input_set_event(n64net_input *net, const void *data, uint32_t size);
  * input arrives, like a prediction). Call after n64net_input_get for the tick. */
 uint32_t n64net_input_get_event(n64net_input *net, int player, uint32_t tick, void *out, uint32_t cap);
 
+/* A remote player's machine left. The deciding machine (the host) calls n64net_input_announce_drop with
+ * tick = n64net_input_player_next(net, player) (the first tick it has no input for): it applies it here and
+ * tells every other machine, which applies it on arrival (not at a simulated tick: the others may be waiting
+ * for that player's inputs). From `tick` on the player's input is neutral and never waited for; a machine
+ * that used other inputs there rolls back; inputs before `tick` that a machine lacks are relayed to it by
+ * any machine that has them. */
+void n64net_input_announce_drop(n64net_input *net, int player, uint32_t tick);
+uint32_t n64net_input_player_next(n64net_input *net, int player);
+/* Applies a drop locally only (what announce_drop does on every machine). */
+void n64net_input_drop_player(n64net_input *net, int player, uint32_t tick);
+
 /* 1 if `tick` may be simulated now: every remote player's inputs are confirmed
  * up to at least tick - rollback_window (lockstep: up to tick). */
 int n64net_input_ready(n64net_input *net, uint32_t tick);

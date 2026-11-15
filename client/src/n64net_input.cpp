@@ -30,6 +30,7 @@ namespace {
 constexpr uint8_t kVersion = 3;   // 3: several players per machine, events, per-peer echo
 constexpr uint32_t kRttRing = 90;  // round trips kept (auto delay uses their 90th percentile)
 constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3;
+constexpr uint8_t kTypeDrop = 4;   // magic | version | type | player (dropped) | 0 | session | u32 from_tick | checksum
 // Input packets whose frames carry the extended fields (right stick, buttons_hi). Only used when a
 // frame in the packet has one of them non-zero, so other games send exactly the old format.
 constexpr uint8_t kTypeFlagRightStick = 0x80;
@@ -125,6 +126,7 @@ struct n64net_input {
     std::vector<Used> used[N64NET_INPUT_MAX_PLAYERS];
     uint32_t next_needed[N64NET_INPUT_MAX_PLAYERS] = {}; // all ticks below are confirmed
     uint32_t highest[N64NET_INPUT_MAX_PLAYERS] = {};     // newest tick received (+1; 0 = none)
+    uint32_t dropped_from[N64NET_INPUT_MAX_PLAYERS];     // a player that left: neutral from this tick (kNoTick = none)
     // ack_from[s][p]: the next tick remote player s's machine needs from our local player p.
     uint32_t ack_from[N64NET_INPUT_MAX_PLAYERS][N64NET_INPUT_MAX_PLAYERS] = {};
 
@@ -188,7 +190,7 @@ struct n64net_input {
     uint32_t FirstNeededFrom(int p) const {
         uint32_t m = kNoTick;
         for (int s = 0; s < cfg.num_players; s++) {
-            if (IsRemote(s)) m = std::min(m, ack_from[s][p]);
+            if (IsRemote(s) && dropped_from[s] == kNoTick) m = std::min(m, ack_from[s][p]);   // (not a machine that left)
         }
         return m == kNoTick ? cfg.start_tick : m;
     }
@@ -201,7 +203,9 @@ struct n64net_input {
     uint32_t MinNextNeeded() const {
         uint32_t m = kNoTick;
         for (int p = 0; p < cfg.num_players; p++) {
-            if (IsRemote(p)) m = std::min(m, next_needed[p]);
+            if (!IsRemote(p)) continue;
+            if (dropped_from[p] != kNoTick && next_needed[p] >= dropped_from[p]) continue;   // left: nothing more to wait for
+            m = std::min(m, next_needed[p]);
         }
         return m;
     }
@@ -262,8 +266,13 @@ struct n64net_input {
     void UpdateAutoDelay(uint64_t now);
     void SendInputs();
     void SendInputsFor(int p);
+    void SendDrop(int player);
+    void RelayFor(int p);
+    uint32_t drop_announces[N64NET_INPUT_MAX_PLAYERS] = {};
+    void DropPlayer(int player, uint32_t tick);
     void SendSync();
     void HandleInput(Reader &r, uint8_t player, uint8_t count, bool right_stick, bool events);
+    void StoreFrames(int player, uint32_t first, uint32_t count, const Slot *frames);
     void HandleSync(Reader &r, uint8_t player, uint8_t count);
     void CompareSync(const SyncEntry &a, const SyncEntry &b);
     static const SyncEntry *FindSync(const SyncEntry *ring, uint32_t count, uint32_t tick, uint8_t kind) {
@@ -297,7 +306,71 @@ void n64net_input::SendInputs() {
     for (int p = 0; p < cfg.num_players; p++) {
         if (IsLocal(p)) SendInputsFor(p);
     }
+    // a departed player: relay its inputs below the drop tick that some machine still lacks, and repeat the
+    // drop notice for a few seconds
+    for (int p = 0; p < cfg.num_players; p++) {
+        if (dropped_from[p] == kNoTick) continue;
+        if (drop_announces[p] > 0) {
+            drop_announces[p]--;
+            SendDrop(p);
+        }
+        RelayFor(p);
+    }
     last_send_usecs = Now();
+}
+
+void n64net_input::SendDrop(int player) {
+    uint8_t buf[32];
+    Writer w{buf};
+    w.U32(N64NET_INPUT_MAGIC);
+    w.U8(kVersion);
+    w.U8(kTypeDrop);
+    w.U8((uint8_t)player);
+    w.U8(0);
+    w.U32(cfg.session_id);
+    w.U32(dropped_from[player]);
+    w.U32(Fnv(buf, (uint32_t)(w.p - buf)));
+    Send(buf, (uint32_t)(w.p - buf));
+}
+
+// Inputs of departed player p that another machine still needs (its ack) and this one has, as if from p.
+void n64net_input::RelayFor(int p) {
+    uint32_t need = kNoTick;
+    for (int s = 0; s < cfg.num_players; s++) {
+        if (s == p || IsLocal(s) || !IsRemote(s)) continue;
+        if (dropped_from[s] != kNoTick) continue;
+        need = std::min(need, ack_from[s][p]);
+    }
+    if (need == kNoTick || need >= dropped_from[p] || need >= next_needed[p]) return;
+    uint8_t buf[N64NET_INPUT_MAX_PACKET];
+    Writer w{buf};
+    const uint32_t upto = std::min(dropped_from[p], next_needed[p]);
+    uint32_t count = std::min<uint32_t>(upto - need, 64);
+    w.U32(N64NET_INPUT_MAGIC);
+    w.U8(kVersion);
+    w.U8(kTypeInput | kTypeFlagRightStick | kTypeFlagEvents);
+    w.U8((uint8_t)p);
+    w.U8((uint8_t)count);
+    w.U32(cfg.session_id);
+    for (int q = 0; q < N64NET_INPUT_MAX_PLAYERS; q++) w.U32(0);   // (no acks: this isn't p's machine)
+    w.U32(need);
+    for (uint32_t i = 0; i < count; i++) {
+        const Slot &sl = remote[p][(need + i) % kRing];
+        w.U16(sl.pad.buttons);
+        w.U8((uint8_t)sl.pad.stick_x);
+        w.U8((uint8_t)sl.pad.stick_y);
+        w.U8((uint8_t)sl.pad.rstick_x);
+        w.U8((uint8_t)sl.pad.rstick_y);
+        w.U16(sl.pad.buttons_hi);
+        w.U8(sl.ev_len);
+        for (uint8_t k = 0; k < sl.ev_len; k++) w.U8(sl.ev[k]);
+    }
+    w.U32(0);   // stamp: none (no round trip from a relay)
+    for (int q = 0; q < 8; q++) w.U32(0);
+    w.U32(0);
+    w.U8(0);
+    w.U32(Fnv(buf, (uint32_t)(w.p - buf)));
+    Send(buf, (uint32_t)(w.p - buf));
 }
 
 // One local player's stream: its inputs from the oldest tick any peer still needs, as many as fit.
@@ -436,6 +509,10 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count, bool ri
     const uint64_t now = Now();
     stats.packets_received++;
     last_recv_usecs = now;
+    if (stamp == 0 && dropped_from[player] != kNoTick) {   // a relay of a departed player's inputs: frames only
+        StoreFrames(player, first, count, frames);
+        return;
+    }
     peer_stamp[player] = stamp;
     peer_stamp_at[player] = now;
     have_peer_stamp[player] = true;
@@ -462,9 +539,13 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count, bool ri
     }
     // What this sender's machine still needs from each of our local players.
     for (int p = 0; p < cfg.num_players; p++) {
-        if (IsLocal(p)) ack_from[player][p] = std::max(ack_from[player][p], acks[p]);
+        ack_from[player][p] = std::max(ack_from[player][p], acks[p]);   // (relays use the others' too)
     }
 
+    StoreFrames(player, first, count, frames);
+}
+
+void n64net_input::StoreFrames(int player, uint32_t first, uint32_t count, const Slot *frames) {
     for (uint32_t i = 0; i < count; i++) {
         const uint32_t tick = first + i;
         if (tick < next_needed[player] || tick >= next_needed[player] + kRing) continue;
@@ -540,6 +621,7 @@ n64net_input *n64net_input_create(const n64net_input_config *config) {
         net->remote[p].resize(kRing);
         net->used[p].resize(kRing);
         net->next_needed[p] = config->start_tick;
+        net->dropped_from[p] = kNoTick;
         for (int q = 0; q < N64NET_INPUT_MAX_PLAYERS; q++) net->ack_from[p][q] = config->start_tick;
     }
     if (net->delay > 0) {
@@ -609,6 +691,7 @@ uint32_t n64net_input_get_event(n64net_input *net, int player, uint32_t tick, vo
     if (net->IsLocal(player)) {
         sl = net->LocalSlot(player, tick);
     } else if (net->IsRemote(player)) {
+        if (net->dropped_from[player] != kNoTick && tick >= net->dropped_from[player]) return 0;   // left
         const Slot &r = net->remote[player][tick % kRing];
         if (r.tick == tick) sl = &r;   // not received yet: no event (a prediction; a late one rolls back)
     }
@@ -616,6 +699,48 @@ uint32_t n64net_input_get_event(n64net_input *net, int player, uint32_t tick, vo
     const uint32_t n = std::min<uint32_t>(sl->ev_len, cap);
     memcpy(out, sl->ev, n);
     return sl->ev_len;
+}
+
+void n64net_input::DropPlayer(int player, uint32_t tick) {
+    dropped_from[player] = tick;
+    // ticks at or after it simulated with other input than neutral: roll back to the first
+    for (uint32_t k = 0; k < kRing; k++) {
+        const Used &u = used[player][k];
+        if (u.tick == kNoTick || u.tick < tick) continue;
+        if (u.pad.buttons || u.pad.stick_x || u.pad.stick_y || u.pad.rstick_x || u.pad.rstick_y || u.pad.buttons_hi) {
+            if (!rollback_pending || u.tick < rollback_tick) rollback_tick = u.tick;
+            rollback_pending = true;
+        }
+    }
+    // a confirmed input at or after the drop tick also had its event/pad applied: neutral from now on
+    for (uint32_t k = 0; k < kRing; k++) {
+        Slot &sl = remote[player][k];
+        if (sl.tick != kNoTick && sl.tick >= tick) {
+            const Used &u = used[player][k];
+            if (u.tick == sl.tick && (sl.ev_len || !PadEq(sl.pad, n64net_pad{0, 0, 0, 0, 0, 0}))) {
+                if (!rollback_pending || sl.tick < rollback_tick) rollback_tick = sl.tick;
+                rollback_pending = true;
+            }
+        }
+    }
+    Log("n64net input: player %d left; neutral from tick %u\n", player, tick);
+}
+
+void n64net_input_drop_player(n64net_input *net, int player, uint32_t tick) {
+    if (player < 0 || player >= N64NET_INPUT_MAX_PLAYERS || !net->IsRemote(player)) return;
+    net->DropPlayer(player, tick);
+}
+
+void n64net_input_announce_drop(n64net_input *net, int player, uint32_t tick) {
+    if (player < 0 || player >= N64NET_INPUT_MAX_PLAYERS || !net->IsRemote(player)) return;
+    net->DropPlayer(player, tick);
+    net->drop_announces[player] = 300;   // repeated with the next ~300 sends (a few seconds)
+    net->SendDrop(player);
+}
+
+uint32_t n64net_input_player_next(n64net_input *net, int player) {
+    if (player < 0 || player >= N64NET_INPUT_MAX_PLAYERS) return 0;
+    return net->next_needed[player];
 }
 
 int n64net_input_ready(n64net_input *net, uint32_t tick) {
@@ -633,6 +758,13 @@ int n64net_input_get(n64net_input *net, int player, uint32_t tick, n64net_pad *o
         return 0;
     }
     if (!net->IsRemote(player)) return 0;  // CPU / empty: neutral
+    if (net->dropped_from[player] != kNoTick && tick >= net->dropped_from[player]) {   // left: neutral
+        Used &u = net->used[player][tick % kRing];
+        u.tick = tick;
+        u.pad = n64net_pad{0, 0, 0, 0, 0, 0};
+        u.predicted = false;
+        return 0;
+    }
     const Slot &s = net->remote[player][tick % kRing];
     Used &u = net->used[player][tick % kRing];
     u.tick = tick;
@@ -678,6 +810,12 @@ int n64net_input_handle_packet(n64net_input *net, const uint8_t *data, uint32_t 
     case kTypeSync:
         net->HandleSync(r, player, count);
         break;
+    case kTypeDrop: {
+        const uint32_t from = r.U32();
+        if (r.ok && player < N64NET_INPUT_MAX_PLAYERS && net->dropped_from[player] == kNoTick) net->DropPlayer(player, from);
+        net->stats.packets_received++;
+        break;
+    }
     case kTypeAway:
     case kTypeBack:
         net->stats.packets_received++;
