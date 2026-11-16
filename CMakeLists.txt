@@ -17,7 +17,9 @@ add_library(n64net STATIC
     client/include/n64net_input.h
     client/src/n64net_rendezvous.cpp
     client/src/n64net_hmac.h
-    client/include/n64net_rendezvous.h)
+    client/include/n64net_rendezvous.h
+    client/src/n64net_match.cpp
+    client/include/n64net_match.h)
 target_include_directories(n64net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/client/include)
 target_compile_features(n64net PRIVATE cxx_std_17)
 

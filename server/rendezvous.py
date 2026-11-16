@@ -49,6 +49,34 @@ in it; it then gets PEER as in a two-player room, and the room takes no one else
 <game> may end in "+<build>": players of the same game with different builds
 cannot stay in sync, so JOIN is refused with "ERR version" (naming the host's
 build) instead of the generic "ERR game".
+Matchmaking ("look for a match"; every message starts with the version word M1, signed like HOST):
+  client -> server
+    PRES M1 <device> <name> <state> <info>   presence, ~every 30 s while the app is open (gone after 90 s)
+                                         device: 6-32 letters/digits, random and kept by the app
+                                         name: percent-encoded UTF-8 (no spaces), <= 96 bytes
+                                         state: lobby | seeking | playing | away; info: "-" or e.g. a game id
+    SEEK M1 <device> <name> <session> <games> <lan_ip:port>
+                                         look for a match (repeat ~every 3 s; dropped after 12 s of silence):
+                                         session = the app's room game id (both must match, e.g.
+                                         "i64-session-1"); games = comma list of "<game>+<build>" it would play
+                                         (a pairing needs at least one in common)
+    UNSEEK M1 <device>                   stop looking
+    LIST M1 <device> <page>              who is online and which rooms are open, page 0..
+    OPEN M1 <device> <code> <0|1>        the host lists its room (HOSTN) as open to join, or not
+  server -> client
+    PRESOK M1 <online>                   people online in the caller's group
+    SEEKING M1 <secs_waited> <others_seeking>
+    MATCH M1 <code> <host|guest> <game> <peer_device> <peer_name> <relay 0|1>
+                                         paired: the host opens <code> with HOSTN (the code is held for it 60 s),
+                                         the guest joins it with JOINN; relay 1 = connect through the server only
+                                         (always 0 between friends; for strangers later). Sent again if either side
+                                         repeats SEEK in the next 60 s.
+    PEOPLE M1 <page> <pages> <name,state,info>...
+    ROOMS M1 <page> <pages> <code,host_name,info,members,max>...
+    OPENOK M1 <code> <0|1>
+  Groups: who may see and meet whom. A caller signed with the server password is in "friends"; on a server
+  without a password everyone is in "open". Invite passes don't reach matchmaking. (Later: a "public" group,
+  where every MATCH says relay 1.)
   client <-> client (not seen by the server unless relayed)
     PUNCH <code> <role> / PUNCHACK <code> <role>
 
@@ -92,12 +120,20 @@ ROOM_IDLE_SECS = 600        # forget rooms idle this long
 RELAY_IDLE_SECS = 120       # forget a relaying room with no traffic this long
 MAX_ROOMS = 5000
 MAX_PACKET = 1500
-AUTH_FIELDS = {"HOST": 3, "JOIN": 3, "RELAY": 1, "BYE": 1, "INVITE": 2, "HOSTN": 3, "JOINN": 3}  # before <time> <mac>
+AUTH_FIELDS = {"HOST": 3, "JOIN": 3, "RELAY": 1, "BYE": 1, "INVITE": 2, "HOSTN": 3, "JOINN": 3,  # before <time> <mac>
+               "PRES": 5, "SEEK": 6, "UNSEEK": 2, "LIST": 3, "OPEN": 4}
 PASS_COMMANDS = {"JOIN": 1, "RELAY": 0, "BYE": 0, "JOINN": 1}  # may use an invite pass; index of <code>
 INVITE_MAX_TTL = 7 * 24 * 3600
 AUTH_WINDOW_SECS = 300      # allowed clock difference
 AUTH_MAX_FAILURES = 10      # per address within AUTH_BAN_SECS ...
 AUTH_BAN_SECS = 600         # ... then that address is ignored this long
+MATCH_VERSION = "M1"
+PRESENCE_SECS = 90          # forget a device this long after its last PRES/SEEK
+SEEK_SECS = 12              # a seeker that stopped repeating SEEK is dropped
+MATCH_HOLD_SECS = 60        # a paired code is held for its host; MATCH is repeated to both meanwhile
+LIST_PER_PAGE = 12
+MAX_PEOPLE = 20000
+STATES = ("lobby", "seeking", "playing", "away")
 
 log = logging.getLogger("n64net")
 
@@ -130,6 +166,31 @@ class Member:
         self.token = secrets.token_hex(8)
 
 
+class Person:
+    """Matchmaking presence: one per device (its random id), refreshed by PRES / SEEK."""
+    def __init__(self, device):
+        self.device = device
+        self.addr = None
+        self.name = "-"
+        self.state = "lobby"
+        self.info = "-"
+        self.group = None
+        self.seen = 0.0
+
+
+class Seeker:
+    def __init__(self, device, since):
+        self.device = device
+        self.since = since
+        self.last = since
+        self.addr = None
+        self.name = "-"
+        self.group = None
+        self.session = ""
+        self.games = []
+        self.lan = "-"
+
+
 class Room:
     def __init__(self, code, game, host_addr, host_lan, multi=False):
         self.code = code
@@ -147,6 +208,8 @@ class Room:
         # with JOIN, so the room is a two-player room from then on.
         self.multi = multi
         self.legacy = False
+        self.open_group = None   # matchmaking: listed as open to this group (OPEN), with the host's device
+        self.open_device = None
         self.members = [Member(host_addr, host_lan)] + [None] * (MAX_MEMBERS - 1) if multi else None
         if multi:
             self.members[0].token = self.host_token
@@ -189,6 +252,11 @@ class Rendezvous(asyncio.DatagramProtocol):
         self.rooms = {}       # code -> Room
         self.by_addr = {}     # endpoint -> Room
         self.transport = None
+        # matchmaking
+        self.people = {}      # device -> Person
+        self.seekers = {}     # device -> Seeker
+        self.matched = {}     # device -> (MATCH text, expiry)
+        self.reserved = {}    # code -> (host ip, expiry): held for a matched host
 
     def connection_made(self, transport):
         self.transport = transport
@@ -199,7 +267,7 @@ class Rendezvous(asyncio.DatagramProtocol):
     def new_code(self):
         for _ in range(100):
             code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
-            if code not in self.rooms:
+            if code not in self.rooms and code not in self.reserved:
                 return code
         return None
 
@@ -356,6 +424,10 @@ class Rendezvous(asyncio.DatagramProtocol):
                 return
         elif not valid_code(code):
             self.send(addr, "ERR badcode")
+            return
+        held = self.reserved.get(code)
+        if held is not None and held[0] != addr[0] and held[1] > time.monotonic():
+            self.send(addr, "ERR taken")   # held for the host a MATCH named
             return
         old = self.rooms.get(code)
         if old is not None:
@@ -542,12 +614,180 @@ class Rendezvous(asyncio.DatagramProtocol):
                     return
             self.drop_room(room, "bye")
 
+    # ---------------------------------------------------------------- matchmaking
+
+    def group_of(self, addr):
+        """Who the caller may see and meet. Every matchmaking command is signed with the password (check_auth),
+        so on a password server the caller is a friend; without one, everyone is in "open"."""
+        return "friends" if self.password is not None else "open"
+
+    @staticmethod
+    def valid_device(d):
+        return 6 <= len(d) <= 32 and d.isascii() and d.isalnum()
+
+    @staticmethod
+    def valid_word(w, limit):
+        return 0 < len(w) <= limit and w.isascii() and "," not in w and all(32 < ord(c) < 127 for c in w)
+
+    def touch_person(self, addr, device, name, state, info):
+        if device not in self.people and len(self.people) >= MAX_PEOPLE:
+            return None
+        p = self.people.get(device)
+        if p is None:
+            p = self.people[device] = Person(device)
+        p.addr, p.name, p.state, p.info = addr, name, state, info
+        p.group = self.group_of(addr)
+        p.seen = time.monotonic()
+        return p
+
+    def check_version(self, addr, args):
+        if not args or args[0] != MATCH_VERSION:
+            self.send(addr, "ERR matchversion")
+            return False
+        return True
+
+    def cmd_PRES(self, addr, args):
+        if not self.check_version(addr, args):
+            return
+        device, name, state, info = args[1], args[2], args[3], args[4]
+        if not self.valid_device(device) or not self.valid_word(name, 96) or state not in STATES or \
+                not self.valid_word(info, 64):
+            self.send(addr, "ERR bad")
+            return
+        p = self.touch_person(addr, device, name, state, info)
+        if p is None:
+            self.send(addr, "ERR busy")
+            return
+        if state != "seeking":
+            self.seekers.pop(device, None)
+        online = sum(1 for o in self.people.values() if o.group == p.group)
+        self.send(addr, f"PRESOK {MATCH_VERSION} {online}")
+
+    def cmd_SEEK(self, addr, args):
+        if not self.check_version(addr, args):
+            return
+        device, name, session, games, lan = args[1], args[2], args[3], args[4], args[5]
+        if not self.valid_device(device) or not self.valid_word(name, 96) or not self.valid_word(session, 64):
+            self.send(addr, "ERR bad")
+            return
+        game_list = [g for g in games.split(",") if g][:64]
+        if not game_list or any(len(g) > 80 for g in game_list):
+            self.send(addr, "ERR bad")
+            return
+        now = time.monotonic()
+        m = self.matched.get(device)
+        if m is not None and m[1] > now:
+            self.send(addr, m[0])       # already paired: say it again
+            return
+        p = self.touch_person(addr, device, name, "seeking", "-")
+        if p is None:
+            self.send(addr, "ERR busy")
+            return
+        me = self.seekers.get(device)
+        if me is None:
+            me = self.seekers[device] = Seeker(device, now)
+            log.info("matchmaking: %s is looking (%s)", device, games)
+        me.addr, me.name, me.group, me.session, me.games, me.lan, me.last = \
+            addr, name, p.group, session, game_list, lan, now
+        # the longest-waiting compatible seeker of the same group
+        best, common = None, None
+        for o in self.seekers.values():
+            if o.device == device or o.group != me.group or o.session != me.session or now - o.last > SEEK_SECS:
+                continue
+            shared = [g for g in o.games if g in me.games]
+            if shared and (best is None or o.since < best.since):
+                best, common = o, shared[0]
+        if best is None:
+            others = sum(1 for o in self.seekers.values()
+                         if o.device != device and o.group == me.group and now - o.last <= SEEK_SECS)
+            self.send(addr, f"SEEKING {MATCH_VERSION} {int(now - me.since)} {others}")
+            return
+        host, guest = best, me      # the one who waited longer hosts
+        code = self.new_code()
+        if code is None:
+            self.send(addr, "ERR busy")
+            return
+        relay = 1 if host.group == "public" else 0
+        expiry = now + MATCH_HOLD_SECS
+        self.reserved[code] = (host.addr[0], expiry)
+        for a, b, role in ((host, guest, "host"), (guest, host, "guest")):
+            text = f"MATCH {MATCH_VERSION} {code} {role} {common} {b.device} {b.name} {relay}"
+            self.matched[a.device] = (text, expiry)
+            self.seekers.pop(a.device, None)
+            if a.device in self.people:
+                self.people[a.device].state = "playing"
+            self.send(a.addr, text)
+        log.info("matchmaking: %s + %s -> room %s (%s)", host.device, guest.device, code, common)
+
+    def cmd_UNSEEK(self, addr, args):
+        if not self.check_version(addr, args):
+            return
+        device = args[1]
+        self.seekers.pop(device, None)
+        self.matched.pop(device, None)
+        p = self.people.get(device)
+        if p is not None and p.addr == addr:
+            p.state = "lobby"
+        self.send(addr, f"SEEKING {MATCH_VERSION} 0 -1")   # -1: not looking any more
+
+    def cmd_OPEN(self, addr, args):
+        if not self.check_version(addr, args):
+            return
+        device, code, flag = args[1], args[2].upper(), args[3]
+        room = self.rooms.get(code)
+        if room is None or room.host != addr or not self.valid_device(device):
+            self.send(addr, "ERR nosuchroom")
+            return
+        if flag == "1":
+            room.open_group, room.open_device = self.group_of(addr), device
+        else:
+            room.open_group, room.open_device = None, None
+        self.send(addr, f"OPENOK {MATCH_VERSION} {code} {1 if room.open_group else 0}")
+
+    def cmd_LIST(self, addr, args):
+        if not self.check_version(addr, args):
+            return
+        device, page = args[1], max(0, int(args[2]))
+        group = self.group_of(addr)
+        people = sorted((p for p in self.people.values() if p.group == group and p.device != device),
+                        key=lambda p: (p.state != "seeking", p.name))
+        rooms = []
+        for r in self.rooms.values():
+            if r.open_group != group or not r.multi or r.legacy:
+                continue
+            members = sum(m is not None for m in r.members)
+            if members >= MAX_MEMBERS:
+                continue
+            host = self.people.get(r.open_device)
+            rooms.append((r.code, host.name if host else "-", host.info if host else "-", members))
+
+        def pages(n):
+            return max(1, (n + LIST_PER_PAGE - 1) // LIST_PER_PAGE)
+
+        sl = slice(page * LIST_PER_PAGE, (page + 1) * LIST_PER_PAGE)
+        self.send(addr, " ".join([f"PEOPLE {MATCH_VERSION} {page} {pages(len(people))}"] +
+                                 [f"{p.name},{p.state},{p.info}" for p in people[sl]]))
+        self.send(addr, " ".join([f"ROOMS {MATCH_VERSION} {page} {pages(len(rooms))}"] +
+                                 [f"{c},{n},{i},{m},{MAX_MEMBERS}" for c, n, i, m in rooms[sl]]))
+
     def expire(self):
         now = time.monotonic()
         for room in list(self.rooms.values()):
             limit = RELAY_IDLE_SECS if room.relay else ROOM_IDLE_SECS
             if now - room.touched > limit:
                 self.drop_room(room, "idle")
+        for d, p in list(self.people.items()):
+            if now - p.seen > PRESENCE_SECS:
+                del self.people[d]
+        for d, sk in list(self.seekers.items()):
+            if now - sk.last > SEEK_SECS:
+                del self.seekers[d]
+        for d, m in list(self.matched.items()):
+            if m[1] <= now:
+                del self.matched[d]
+        for c, h in list(self.reserved.items()):
+            if h[1] <= now:
+                del self.reserved[c]
 
 
 NATPMP_PORT = 5351

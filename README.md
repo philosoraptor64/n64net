@@ -55,6 +55,22 @@ first existing of `SDL2::SDL2-static`, `SDL2::SDL2`, `SDL2-static`, `SDL2`).
    `n64net_rendezvous_parse_invite()`, which yields the pass. The guest sets `config.invite_pass` (and no
    password): it may then join that room only, until the pass expires (default 24 h, max 7 days).
 
+### Matchmaking ("look for a match")
+`n64net_match.h` (server protocol: `server/rendezvous.py`, "Matchmaking"). Everyone who can sign with the
+server password is in one group ("friends"); they can see who is online, look for a partner, and list open rooms.
+1. Generate a device id once (`n64net_match_new_device`) and keep it; fill `N64NetMatchConfig` (server,
+   password, device, display name in UTF-8).
+2. While the app is open: `n64net_match_presence(sock, &cfg, "lobby"|"playing"|"away", info)` every ~30 s.
+3. Look for a match: `n64net_match_seek(sock, &cfg, session_game_id, "game+build,game+build,...", lan)` every
+   ~3 s; answers go through `n64net_match_parse()`. `N64NET_MATCH_SEEKING` = still looking;
+   `N64NET_MATCH_FOUND` = paired: the host connects with `room = ev.code, is_host = 1`, the guest with
+   `is_host = 0` (`force_relay = ev.relay`), using `n64net_rendezvous_connect` as above (`max_members` up to 4).
+   `ev.game` is the first game both listed. `n64net_match_unseek` cancels.
+4. The lobby: `n64net_match_list(sock, &cfg, page)` answers `N64NET_MATCH_PEOPLE` and `N64NET_MATCH_ROOMS`
+   (12 per page). A host that lets others drop in calls `n64net_match_open(sock, &cfg, room, 1)`; listed rooms
+   are joined like any room (JOINN, password-signed).
+5. Tests: `server/test_match.py`; `client/test/match_test.cpp` (end to end, header has the build line).
+
 ### Voice chat
 - When connected: `n64net_voice_start(&config)` (`enabled`, `push_to_talk`, `test_tone` for tests without a
   microphone, `log`); `n64net_voice_stop()` when the session ends. Call both from the game thread.
