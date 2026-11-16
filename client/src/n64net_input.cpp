@@ -163,6 +163,17 @@ struct n64net_input {
     // confirmed after it; the game applies retire_action at retire_apply. It stops being "remote" (nothing
     // waits for it), so its stragglers are ignored.
     bool retired[N64NET_INPUT_MAX_PLAYERS] = {};
+    // A player nobody played so far (a CPU from the start, an empty slot) that a joiner takes over
+    // (n64net_input_add): kept as "retired since the start" inside (neutral until the joiner's tick, the
+    // admit machinery as is), but n64net_input_retired() doesn't report it (nobody left).
+    bool open_slot[N64NET_INPUT_MAX_PLAYERS] = {};
+    void MarkOpenSlot(int p) {
+        retired[p] = true;
+        open_slot[p] = true;
+        retire_last[p] = UINT32_MAX;            // no real inputs at all (the slots never hold any)
+        retire_apply[p] = cfg.start_tick;
+        retire_action_len[p] = 0;
+    }
     uint32_t retire_last[N64NET_INPUT_MAX_PLAYERS] = {}, retire_apply[N64NET_INPUT_MAX_PLAYERS] = {};
     uint8_t retire_action[N64NET_INPUT_MAX_PLAYERS][N64NET_INPUT_MAX_EVENT] = {};
     uint8_t retire_action_len[N64NET_INPUT_MAX_PLAYERS] = {};
@@ -692,6 +703,7 @@ void n64net_input::ApplyRetire(int p, uint32_t last, uint32_t apply, const uint8
     }
     if (highest_got > apply) RequestRollback(apply);   // the game must change the player at `apply`
     retired[p] = true;
+    open_slot[p] = false;
     join_from[p] = kNoTick;
     retire_last[p] = last;
     retire_apply[p] = apply;
@@ -758,7 +770,7 @@ void n64net_input::SendLog(uint32_t first, uint32_t *next) {
     w.U32(first);
     w.U8((uint8_t)np);
     for (int p = 0; p < np; p++) {
-        w.U8((uint8_t)((retired[p] ? 1 : 0) | (join_from[p] != kNoTick ? 2 : 0)));
+        w.U8((uint8_t)((retired[p] ? 1 : 0) | (join_from[p] != kNoTick ? 2 : 0) | (open_slot[p] ? 4 : 0)));
         w.U32(retire_last[p]);
         w.U32(retire_apply[p]);
         w.U32(join_from[p]);
@@ -862,6 +874,7 @@ void n64net_input::HandleLog(Reader &r, uint8_t count, bool ext) {
         const Info &in = info[p];
         if (!(in.state & 1)) continue;
         retired[p] = true;
+        open_slot[p] = (in.state & 4) != 0;
         retire_last[p] = in.last;
         retire_apply[p] = in.apply;
         retire_action_len[p] = in.alen;
@@ -979,6 +992,7 @@ void n64net_input::ApplyRejoin(uint32_t mask, uint32_t tick) {
     bool mine = false;
     for (int p = 0; p < cfg.num_players; p++) {
         if (!(mask & (1u << p)) || join_from[p] == tick) continue;
+        if (!retired[p] && !IsRemote(p) && !IsLocal(p)) MarkOpenSlot(p);   // n64net_input_add on the host
         join_from[p] = tick;
         if (IsLocal(p)) {   // this machine is the joiner
             mine = true;
@@ -1443,7 +1457,9 @@ int n64net_input_retire(n64net_input *net, int player, const void *action, uint3
 
 int n64net_input_retired(n64net_input *net, int player, uint32_t *last_tick, uint32_t *apply_tick, void *action,
                          uint32_t *size) {
-    if (!net || player < 0 || player >= N64NET_INPUT_MAX_PLAYERS || !net->retired[player]) return 0;
+    if (!net || player < 0 || player >= N64NET_INPUT_MAX_PLAYERS || !net->retired[player] || net->open_slot[player]) {
+        return 0;
+    }
     if (last_tick) *last_tick = net->retire_last[player];
     if (apply_tick) *apply_tick = net->retire_apply[player];
     if (action && size) {
@@ -1476,6 +1492,29 @@ int n64net_input_admit(n64net_input *net, uint32_t player_mask) {
     net->Log("n64net input: a machine joins as players %x: sending it the log (%u ticks so far)\n", player_mask,
              net->log_end - net->cfg.start_tick);
     net->ServeJoiner();
+    return 1;
+}
+
+int n64net_input_add(n64net_input *net, uint32_t player_mask) {
+    if (!net || net->cfg.joining || player_mask == 0 || (player_mask >> net->cfg.num_players)) return 0;
+    if (net->admit_mask) return 0;   // a join is already under way
+    uint32_t marked = 0;
+    for (int p = 0; p < net->cfg.num_players; p++) {
+        if (!(player_mask & (1u << p))) continue;
+        if (net->open_slot[p] && net->join_from[p] == kNoTick) continue;   // (asked again)
+        if (net->IsLocal(p) || net->IsRemote(p) || net->retired[p]) return 0;   // someone plays it, or it left
+        marked |= 1u << p;
+    }
+    for (int p = 0; p < net->cfg.num_players; p++) {
+        if (marked & (1u << p)) net->MarkOpenSlot(p);
+    }
+    if (!n64net_input_admit(net, player_mask)) {
+        for (int p = 0; p < net->cfg.num_players; p++) {
+            if (marked & (1u << p)) net->retired[p] = net->open_slot[p] = false;
+        }
+        return 0;
+    }
+    net->Log("n64net input: players %x were nobody's so far (CPUs or empty): the joiner takes them\n", player_mask);
     return 1;
 }
 

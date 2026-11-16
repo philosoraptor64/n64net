@@ -150,6 +150,15 @@ int n64net_input_retired(n64net_input *net, int player, uint32_t *last_tick, uin
  * Returns 1, or 0 if a player in mask isn't retired, a join is already under way, or this is the joiner. */
 int n64net_input_admit(n64net_input *net, uint32_t player_mask);
 /* The joiner: 1 until it has played up to the tick its players go live at (fast-forward). */
+/* Joining into a player nobody has played so far (a CPU since the start, an empty slot: on every machine in
+ * neither local_mask nor remote_mask): the host calls n64net_input_add(net, mask) in place of
+ * n64net_input_admit. From there it is the same: the joiner (config.joining = 1, local_mask = mask) catches up,
+ * and every machine's n64net_input_rejoined() reports the tick from which the players are human (the game turns
+ * its CPU into a human there, also in a resimulation). Before that tick their inputs are neutral, as always.
+ * n64net_input_retired() never reports such a player (nobody left). Returns 1, or 0 if a player in mask is
+ * someone's, has left (use admit), or a join is already under way. Sessions with such players must give
+ * remote_mask explicitly (0 means "everyone not local", which would count the open players as remote). */
+int n64net_input_add(n64net_input *net, uint32_t player_mask);
 int n64net_input_catching_up(n64net_input *net);
 /* 1 if `player` is human again (a joiner took it over) from *tick on. */
 int n64net_input_rejoined(n64net_input *net, int player, uint32_t *tick);

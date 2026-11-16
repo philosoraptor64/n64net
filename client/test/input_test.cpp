@@ -303,8 +303,10 @@ void SendToPlayer(void *user, int player, const uint8_t *data, uint32_t size) {
 // A machine leaves at tick leave_at; 300 ms later the host gives its players CPUs; at tick join_at (host) a new
 // machine joins in its place: the host admits it, it fast-forwards through the log (up to `ff` ticks per ms)
 // and takes the players over. Every machine, the joiner included, must hold the same state at every tick.
+// add = true: machine `leaver` never exists before join_at: its players were CPUs from the start (nobody's), and
+// the host takes the joiner in with n64net_input_add instead of a retirement + admit.
 bool RunJoin(const char *name, const uint32_t *masks, int machines, uint32_t window, uint32_t delay, Net net,
-             int leaver, uint32_t leave_at, uint32_t join_at, uint32_t ff, uint32_t ticks) {
+             int leaver, uint32_t leave_at, uint32_t join_at, uint32_t ff, uint32_t ticks, bool add = false) {
     g_now = 0;
     g_rng = 999;
     g_silent = g_gone = -1;
@@ -335,11 +337,20 @@ bool RunJoin(const char *name, const uint32_t *masks, int machines, uint32_t win
         c.user = (void *)(intptr_t)i;
         c.now_usecs = Now;
         c.joining = joining ? 1 : 0;
+        if (add && !joining) {   // the open slots are nobody's: neither local nor remote here
+            uint32_t all = 0;
+            for (int k = 0; k < machines; k++) all |= masks[k];
+            c.remote_mask = all & ~masks[leaver] & ~masks[i];
+        }
         m.net = n64net_input_create(&c);
         return m.net != nullptr;
     };
-    for (int i = 0; i < machines; i++) if (!make(i, false)) return false;
-    bool left = false, retired = false, joined = false, admitted = false;
+    for (int i = 0; i < machines; i++) {
+        if (add && i == leaver) { g_m[i] = Machine(); g_m[i].id = i; continue; }   // not there yet
+        if (!make(i, false)) return false;
+    }
+    bool left = add, retired = add, joined = false, admitted = false;
+    if (add) g_silent = g_gone = leaver;
     uint64_t left_us = 0;
     uint64_t caught_up_us = 0, joined_us = 0;
     const n64net_rollback_callbacks cb0 = { Save, Load, Advance, nullptr, kSlots };
@@ -375,7 +386,10 @@ bool RunJoin(const char *name, const uint32_t *masks, int machines, uint32_t win
         }
         if (joined && !admitted && g_now > joined_us + 50000) {   // the host accepts it 50 ms later
             admitted = true;
-            if (!n64net_input_admit(g_m[0].net, masks[leaver])) { printf("%s: admit refused\n", name); return false; }
+            if (add ? !n64net_input_add(g_m[0].net, masks[leaver]) : !n64net_input_admit(g_m[0].net, masks[leaver])) {
+                printf("%s: %s refused\n", name, add ? "add" : "admit");
+                return false;
+            }
         }
         for (auto it = g_wire.begin(); it != g_wire.end();) {
             if (it->to == g_gone || !g_m[it->to].net) { it = g_wire.erase(it); continue; }
@@ -456,6 +470,7 @@ bool RunJoin(const char *name, const uint32_t *masks, int machines, uint32_t win
 } // namespace
 
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);   // a crash still shows the results so far
     bool all = true;
     const uint32_t two[] = { 1u << 0, 1u << 1 };
     const uint32_t three_2local[] = { 1u << 0, (1u << 1) | (1u << 2), 1u << 3 };
@@ -478,6 +493,11 @@ int main() {
     all &= RunJoin("join: 3 machines, rollback, bad network", three_2local, 3, 8, 2, bad, 2, 300, 900, 20, 1600);
     all &= RunJoin("join: 3 machines, the joiner has 2 players", three_2local, 3, 8, 2, bad, 1, 400, 1000, 10, 1800);
     all &= RunJoin("join: 4 machines, rollback, cellular", four, 4, 8, 3, cell, 3, 500, 1100, 8, 1800);
+    // joining into a player nobody played (a CPU from the start)
+    const uint32_t two_and_slot[] = { 1u << 0, 1u << 1, 1u << 2 };
+    all &= RunJoin("add: 2 machines + a CPU slot, lockstep", two_and_slot, 3, 0, 2, clean, 2, 0, 600, 20, 1200, true);
+    all &= RunJoin("add: 3 machines (CPU slots 1+2), rollback, bad", three_2local, 3, 8, 2, bad, 1, 0, 800, 20, 1500, true);
+    all &= RunJoin("add: 4 machines (slot 3), rollback, cellular", four, 4, 8, 3, cell, 3, 0, 900, 8, 1600, true);
     printf("%s\n", all ? "ALL PASS" : "SOME FAILED");
     return all ? 0 : 1;
 }
