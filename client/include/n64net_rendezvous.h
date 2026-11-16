@@ -36,6 +36,8 @@ typedef struct N64NetRendezvousConfig {
     int max_members;
 } N64NetRendezvousConfig;
 
+#define N64NET_RENDEZVOUS_MAX_PENDING 4
+
 typedef struct N64NetRendezvousResult {
     struct sockaddr_in peer; /* where to send gameplay packets */
     int relayed;             /* 1 = peer is the server, which forwards */
@@ -59,6 +61,12 @@ typedef struct N64NetRendezvousResult {
     /* Rooms for up to 4: this machine's member index (0 = host) and the paired member's. */
     int member_index;
     int peer_index;
+    /* Rooms for up to 4: MEMBER datagrams about the OTHER members that arrived while connecting (e.g. two
+     * guests joining at the same instant: the server introduces them once). Hand each to
+     * n64net_rendezvous_parse_member as if it had arrived on the socket after connect. */
+    int pending_count;
+    int pending_len[N64NET_RENDEZVOUS_MAX_PENDING];
+    char pending[N64NET_RENDEZVOUS_MAX_PENDING][256];
 } N64NetRendezvousResult;
 
 /* Rooms for up to 4. A datagram from the server: "MEMBER": another member (fills its index, public and

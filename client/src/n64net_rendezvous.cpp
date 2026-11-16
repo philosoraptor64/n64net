@@ -148,7 +148,26 @@ class Session {
             return 0;
         }
         buf[n] = '\0';
+        // Once paired (hole punching, relay), a MEMBER about another member of a room for up to 4 is kept for
+        // the app instead of being lost here: the server sends it only once per join.
+        if (mPaired && SameAddr(*from, mServer) && IsMember(buf, (int)n)) {
+            Stash(buf, (int)n);
+            return 0;
+        }
         return (int)n;
+    }
+    static bool IsMember(const char *buf, int n) {
+        return n >= (int)kPrefixLen + 7 && std::memcmp(buf, kPrefix, kPrefixLen) == 0 &&
+               std::memcmp(buf + kPrefixLen, "MEMBER ", 7) == 0;
+    }
+    void Stash(const char *buf, int n) {
+        const std::string m(buf, (size_t)n);
+        for (const std::string &p : mPending) {
+            if (p == m) return;   // the server repeats MEMBERs (re-registration, punching): keep one of each
+        }
+        if (mPending.size() < N64NET_RENDEZVOUS_MAX_PENDING) {
+            mPending.push_back(m);
+        }
     }
     static bool IsControl(const char *buf, int n) {
         return n >= (int)kPrefixLen && std::memcmp(buf, kPrefix, kPrefixLen) == 0;
@@ -188,6 +207,8 @@ class Session {
     std::vector<sockaddr_in> mCandidates;
     std::string mToken;   // PEER's 6th field: this side's move token
     int mMemberIndex = 0, mPeerIndex = 0;
+    bool mPaired = false;                // WaitForPeer found the first member
+    std::vector<std::string> mPending;   // MEMBER datagrams about other members, for the app (result.pending)
     sockaddr_in mPeer{};
     std::string mError;
 };
@@ -245,7 +266,11 @@ bool Session::WaitForPeer() {
         } else if (f[0] == "MEMBER" && f.size() >= 7) {
             // a room for up to 4: a guest pairs with the host (member 0) first, the host with any guest
             const int idx = atoi(f[2].c_str());
-            if (!mIsHost && idx != 0) continue;
+            if (!mIsHost && idx != 0) {
+                // another guest, before the host's MEMBER: the app meets it after connecting (result.pending)
+                Stash(buf, n);
+                continue;
+            }
             sockaddr_in pub{}, lan{};
             if (!Resolve(f[3], &pub)) continue;
             mCandidates.clear();
@@ -409,6 +434,7 @@ int Session::Run(N64NetRendezvousResult *out) {
         std::snprintf(out->error, sizeof(out->error), "%s", mError.c_str());
         return -2;
     }
+    mPaired = true;
     bool relayed = false;
     if (mCfg.force_relay || !Punch()) {
         if (!mCfg.force_relay) {
@@ -428,6 +454,14 @@ int Session::Run(N64NetRendezvousResult *out) {
     std::snprintf(out->token, sizeof(out->token), "%s", mToken.c_str());
     out->member_index = mMemberIndex;
     out->peer_index = mPeerIndex;
+    out->pending_count = 0;
+    for (const std::string &m : mPending) {
+        const size_t len = m.size() < sizeof(out->pending[0]) - 1 ? m.size() : sizeof(out->pending[0]) - 1;
+        std::memcpy(out->pending[out->pending_count], m.data(), len);
+        out->pending[out->pending_count][len] = '\0';
+        out->pending_len[out->pending_count] = (int)len;
+        out->pending_count++;
+    }
     return 0;
 }
 

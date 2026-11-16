@@ -37,6 +37,9 @@ int n64net_match_seek(int sock, const N64NetMatchConfig *config, const char *ses
                       const char *lan);
 int n64net_match_unseek(int sock, const N64NetMatchConfig *config);
 int n64net_match_list(int sock, const N64NetMatchConfig *config, int page);
+/* OPEN must go out on the room host's OWN socket (the session socket that hosted the room, also while the room
+ * still waits): the server only accepts it from the room host's address (else "ERR nosuchroom"), and the OPENOK
+ * comes back on that socket. Repeat until OPENOK: right after hosting, the room may not be on the server yet. */
 int n64net_match_open(int sock, const N64NetMatchConfig *config, const char *room_code, int open);
 
 enum {

@@ -26,6 +26,7 @@ int MakeSock() {
 struct Side {
     int sock = -1;
     bool host = false;
+    const char *room = "QQQQ";
     int rc = -99;
     N64NetRendezvousResult res{};
 };
@@ -34,7 +35,7 @@ void Connect(Side *s) {
     N64NetRendezvousConfig c{};
     c.server = "127.0.0.1:7798";
     c.game = "test+1";
-    c.room = "QQQQ";
+    c.room = s->room;
     c.is_host = s->host ? 1 : 0;
     c.wait_secs = 10;
     c.max_members = 4;
@@ -42,7 +43,61 @@ void Connect(Side *s) {
 }
 } // namespace
 
+// the member indices `s` learns about: MEMBERs kept while connecting (res.pending) and those arriving after
+unsigned KnownMembers(Side *s, int ms) {
+    unsigned known = 0;
+    auto take = [&](const char *buf, int n) {
+        char room[8];
+        int idx = -1, mine = -1;
+        sockaddr_in pub{}, lan{};
+        char tok[24];
+        if (n64net_rendezvous_parse_member(buf, n, room, &idx, &pub, &lan, &mine, tok, sizeof(tok)) == 1 && idx >= 0) {
+            known |= 1u << idx;
+        }
+    };
+    for (int i = 0; i < s->res.pending_count; i++) take(s->res.pending[i], s->res.pending_len[i]);
+    for (int t = 0; t < ms; t += 10) {
+        char buf[512];
+        ssize_t n = recv(s->sock, buf, sizeof(buf), 0);
+        if (n > 0) take(buf, (int)n);
+        else usleep(10000);
+    }
+    return known;
+}
+
+// Two guests joining in the same instant (the friend agent's report, 2026-11-16): each must still learn about the
+// other, although its connect only pairs it with the host.
+bool SimultaneousGuests() {
+    Side h, g1, g2;
+    h.host = true;
+    h.room = g1.room = g2.room = "RRRR";
+    h.sock = MakeSock();
+    g1.sock = MakeSock();
+    g2.sock = MakeSock();
+    std::thread th(Connect, &h);
+    usleep(300000);
+    std::thread t1(Connect, &g1), t2(Connect, &g2);
+    th.join();
+    t1.join();
+    t2.join();
+    unsigned k1 = 0, k2 = 0;
+    std::thread r1([&] { k1 = KnownMembers(&g1, 800); }), r2([&] { k2 = KnownMembers(&g2, 800); });
+    r1.join();
+    r2.join();
+    const int other1 = g1.res.member_index == 1 ? 2 : 1, other2 = g2.res.member_index == 1 ? 2 : 1;
+    const bool ok = h.rc == 0 && g1.rc == 0 && g2.rc == 0 && (k1 & (1u << other1)) && (k2 & (1u << other2));
+    printf("simultaneous guests: rc %d/%d/%d, guest %d knows 0x%x (kept %d), guest %d knows 0x%x (kept %d) -> %s\n",
+           h.rc, g1.rc, g2.rc, g1.res.member_index, k1, g1.res.pending_count, g2.res.member_index, k2,
+           g2.res.pending_count, ok ? "PASS" : "FAIL");
+    close(h.sock);
+    close(g1.sock);
+    close(g2.sock);
+    return ok;
+}
+
 int main() {
+    bool all = true;
+    for (int i = 0; i < 5; i++) all &= SimultaneousGuests();
     Side h, g1, g2;
     h.host = true;
     h.sock = MakeSock();
@@ -79,5 +134,5 @@ int main() {
     printf("connect rc %d/%d/%d, members %d/%d/%d (paired with %d/%d/%d), later MEMBER 2 seen by host %d guest1 %d -> %s\n",
            h.rc, g1.rc, g2.rc, h.res.member_index, g1.res.member_index, g2.res.member_index, h.res.peer_index,
            g1.res.peer_index, g2.res.peer_index, host_saw, g1_saw, ok ? "PASS" : "FAIL");
-    return ok ? 0 : 1;
+    return (ok && all) ? 0 : 1;
 }
