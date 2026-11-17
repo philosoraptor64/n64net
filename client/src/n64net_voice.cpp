@@ -109,7 +109,10 @@ struct Stream {
     std::atomic<int64_t> speakUntilMs{0};
 };
 Stream sStreams[kStreams];
-constexpr float kVoiceGain = 1.4f;
+constexpr float kVoiceGain = 2.0f;
+// The game's own audio is turned down a little while voice chat runs, so voices sit above it without clipping
+// (N64 games mix close to full scale), and further while someone talks (sDucker).
+constexpr float kGameLevelWithVoice = 0.7f;
 // Send side: speech is levelled before encoding (quiet talking at arm's
 // length comes out like a raised voice). Receive side: the game's audio dips
 // while the other player talks. Debug: N64NET_VOICE_LEVELER=0, N64NET_VOICE_DUCK=0.
@@ -337,7 +340,7 @@ void DecodeNext(Stream &st) {
         std::memset(st.pcm, 0, sizeof(st.pcm));
     }
     if (Rms(st.pcm, kFrame) > kSpeakingRms) {
-        sRemoteSpeakUntilMs = NowMs() + 250;
+        sRemoteSpeakUntilMs = NowMs() + 600;   // (held between words: the game doesn't pump up and down)
         st.speakUntilMs = NowMs() + 250;
         sAudibleFrames++;
     }
@@ -563,8 +566,11 @@ extern "C" void n64net_voice_mix(int16_t *stereo, int frames, int rate) {
             }
         }
         for (int ch = 0; ch < 2; ch++) {
-            int s = static_cast<int>(stereo[i * 2 + ch] * duck) + static_cast<int>(v);
-            stereo[i * 2 + ch] = static_cast<int16_t>(s > 32767 ? 32767 : (s < -32768 ? -32768 : s));
+            const float s = stereo[i * 2 + ch] * duck * kGameLevelWithVoice + v;
+            // soft limit above about -3 dBFS instead of hard clipping (loud voice over loud game)
+            const float a = std::fabs(s), knee = 23000.0f;
+            const float o = a <= knee ? a : knee + (32767.0f - knee) * std::tanh((a - knee) / (32767.0f - knee));
+            stereo[i * 2 + ch] = static_cast<int16_t>(s < 0 ? -o : o);
         }
     }
 }

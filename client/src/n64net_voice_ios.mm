@@ -12,7 +12,8 @@ extern "C" int n64net_voice_ios_enable_voice_processing(int processing, char *er
     // sound from the earpiece, the bottom mic tuned for a mouth a few cm
     // away. Players hold the phone in their hands, so ask for the
     // loudspeaker (headphones still win when connected) in the same call.
-    AVAudioSessionCategoryOptions options = s.categoryOptions | AVAudioSessionCategoryOptionDefaultToSpeaker;
+    AVAudioSessionCategoryOptions options = s.categoryOptions | AVAudioSessionCategoryOptionDefaultToSpeaker |
+        AVAudioSessionCategoryOptionAllowBluetooth | AVAudioSessionCategoryOptionAllowBluetoothA2DP;
     NSString *category = s.category;
     if (![category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
         category = AVAudioSessionCategoryPlayAndRecord;

@@ -117,7 +117,7 @@ private:
 // Receive side: turn the game's audio down while the other player talks.
 class Ducker {
 public:
-    static constexpr float kDucked = 0.5f;  // -6 dB
+    static constexpr float kDucked = 0.25f;  // -12 dB (owner, 2026-11-17: -6 dB was barely audible)
     // Per output sample: `talking` = the other player's voice is audible now.
     float Next(bool talking, int rate) {
         const float target = talking ? kDucked : 1.0f;

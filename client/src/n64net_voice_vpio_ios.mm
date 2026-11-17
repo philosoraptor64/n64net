@@ -146,9 +146,13 @@ bool ConfigureSession(char *error, unsigned error_size) {
     AVAudioSession *s = [AVAudioSession sharedInstance];
     NSError *err = nil;
     // Loudspeaker unless headphones are connected (the phone is in the
-    // player's hands, not at their ear); keep the options SDL chose.
+    // player's hands, not at their ear); keep the options SDL chose. Bluetooth
+    // allowed: AirPods and other headsets stay the route (hands-free for the
+    // mic; A2DP when only output is in use) instead of the session falling back
+    // to the speaker when voice chat starts.
     const AVAudioSessionCategoryOptions options =
-        s.categoryOptions | AVAudioSessionCategoryOptionDefaultToSpeaker;
+        s.categoryOptions | AVAudioSessionCategoryOptionDefaultToSpeaker |
+        AVAudioSessionCategoryOptionAllowBluetooth | AVAudioSessionCategoryOptionAllowBluetoothA2DP;
     if (![s setCategory:AVAudioSessionCategoryPlayAndRecord mode:AVAudioSessionModeVoiceChat options:options
                   error:&err]) {
         snprintf(error, error_size, "audio session: %s", err.localizedDescription.UTF8String);
