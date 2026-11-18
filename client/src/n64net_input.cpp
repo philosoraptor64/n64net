@@ -440,7 +440,8 @@ struct n64net_input {
         const uint32_t target =
             std::min(std::max({ want_normal, need_laggy, Wish() }), LaggyMaxDelay());
         // the laggy machine runs ahead of its normal peers by everything their delays don't cover
-        *excess = need_normal > target ? std::min(need_normal - target, cfg.rollback_window ? cfg.rollback_window - 1 : 0) : 0;
+        // (at most window - 3, so it stays clear of the window: past it, it would wait instead of rolling back)
+        *excess = need_normal > target ? std::min(need_normal - target, cfg.rollback_window > 3 ? cfg.rollback_window - 3 : 0) : 0;
         return target;
     }
     void UpdateAutoDelay(uint64_t now);
@@ -1460,7 +1461,7 @@ int n64net_timesync_should_skip(n64net_input *net) {
     }
     // A laggy machine carries the rollback its peers' delays don't cover: it may run lag_excess ticks further
     // ahead before it waits (its normal peers then never wait or roll back for it).
-    if (net->ahead16 < (3 + 2 * (int32_t)net->lag_excess) * 16) return 0;  // 1.5+ ticks ahead
+    if (net->ahead16 < (3 + (int32_t)net->lag_excess) * 16) return 0;  // 1.5+ ticks ahead
     net->timesync_cooldown = net->cfg.ticks_per_second / 2;
     net->ahead16 -= 2 * 16;  // a skip closes the gap by one tick
     net->stats.timesync_skips++;

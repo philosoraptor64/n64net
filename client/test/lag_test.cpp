@@ -28,6 +28,7 @@ constexpr int kMax = 4;
 constexpr uint32_t kTicks = 3600;   // a minute at 60
 constexpr uint32_t kSlots = 64;
 uint32_t g_lat[kMax][kMax];         // one-way ms
+bool g_uplink_only = false;         // the laggy machine's sends are slow, what it receives is fast
 uint32_t g_jitter_ms = 0, g_loss = 0;
 int g_n = 0;
 
@@ -90,7 +91,8 @@ bool Run(const char *name, int n, int laggy, uint32_t fast_ms, uint32_t slow_ms,
     g_wire.clear();
     g_n = n;
     for (int a = 0; a < n; a++)
-        for (int b = 0; b < n; b++) g_lat[a][b] = (a == laggy || b == laggy) ? slow_ms : fast_ms;
+        for (int b = 0; b < n; b++)
+            g_lat[a][b] = (a == laggy || (b == laggy && !g_uplink_only)) ? slow_ms : fast_ms;
     for (int i = 0; i < n; i++) {
         g_m[i] = M();
         n64net_input_config c = {};
@@ -210,6 +212,12 @@ int main() {
     ok &= Run("3 machines, one laggy", 3, 2, 20, 150, 0, r);
     check("lockstep: the normal machines keep a normal delay (<= 6)", r[0].delay <= 6 && r[1].delay <= 6);
     check("lockstep: the normal machines stall little", r[0].stalls <= 60 && r[1].stalls <= 60);
+    g_uplink_only = true;   // a bad uplink (e.g. a phone on a busy cell): only its sends are slow
+    ok &= Run("3 machines, one with a slow uplink (300 ms)", 3, 2, 15, 300, 8, r);
+    check("uplink: the normal machines don't stall, roll back little", r[0].stalls <= 30 && r[1].stalls <= 30 &&
+                                                                       (double)r[0].resim / r[0].frames < 1.5);
+    check("uplink: the laggy machine doesn't stall either", r[2].stalls <= 60);
+    g_uplink_only = false;
     ok &= Run("2 machines on a slow link", 2, -1, 150, 150, 8, r);
     check("2 machines: the same delay on both sides", r[0].delay == r[1].delay);
     ok &= Run("4 machines, all normal", 4, -1, 25, 25, 8, r);
