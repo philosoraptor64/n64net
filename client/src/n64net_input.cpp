@@ -64,6 +64,7 @@ constexpr uint32_t kLaggyMaxDelayMs = 250, kLaggyMaxDelayLockstepMs = 450, kLagg
 // After a machine becomes laggy it waits this long before trusting its peers' laggy flags (they arrive a
 // one-way trip later; a peer on the same slow link is about to say it is laggy too).
 constexpr uint64_t kLaggySettleUsecs = 1500000;
+constexpr uint32_t kLaggyMaxExcess = 6;
 constexpr uint8_t kLagFlagLaggy = 1;
 constexpr uint32_t kRing = 1024;           // ticks of history kept per player
 // Frames per input packet, from the oldest tick the peer still needs (its ack) up to the newest.
@@ -440,8 +441,11 @@ struct n64net_input {
         const uint32_t target =
             std::min(std::max({ want_normal, need_laggy, Wish() }), LaggyMaxDelay());
         // the laggy machine runs ahead of its normal peers by everything their delays don't cover
-        // (at most window - 3, so it stays clear of the window: past it, it would wait instead of rolling back)
-        *excess = need_normal > target ? std::min(need_normal - target, cfg.rollback_window > 3 ? cfg.rollback_window - 3 : 0) : 0;
+        // (at most window - 3, so it stays clear of the window: past it, it would wait instead of rolling back;
+        // and at most kLaggyMaxExcess, whatever the window: a game with a deep window for spikes must not roll
+        // back that deep every frame)
+        *excess = need_normal > target ? std::min({ need_normal - target, kLaggyMaxExcess,
+                                                    cfg.rollback_window > 3 ? cfg.rollback_window - 3 : 0u }) : 0;
         return target;
     }
     void UpdateAutoDelay(uint64_t now);
