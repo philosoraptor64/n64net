@@ -8,7 +8,10 @@
  *                    [, u8 event length, event bytes if type & 0x40]) |
  *           u32 stamp (sender clock, usecs) | u32 echo[4] (newest stamp received from each
  *           player's machine) | u32 hold[4] (usecs since that stamp arrived) |
- *           s32 advantage | u8 wished delay (auto delay; 0 = none) | u32 checksum
+ *           s32 advantage | u8 wished delay (auto delay; 0 = none) |
+ *           [u8 lag flags (bit 0: this machine is the laggy one) | u8 its input delay now] | u32 checksum
+ *           (the two lag bytes were added later: older builds ignore them, and a packet without them
+ *           counts as "not laggy, delay unknown")
  *   A machine with several local players (local_mask) sends one input stream per player; events
  *   ride in its first local player's stream. Up to 4 machines: every packet goes to every peer.
  *   sync:   magic | version | type=1 | player | count | session |
@@ -53,13 +56,22 @@ constexpr uint32_t kRetireRepeats = 200;  // RETIRE packets sent with the next i
 constexpr uint8_t kTypeFlagRightStick = 0x80;
 // Input packets whose frames carry an event length byte (+ bytes): only when one of them has an event.
 constexpr uint8_t kTypeFlagEvents = 0x40;
-constexpr uint32_t kHeaderBytes = 32, kTrailerBytes = 4 + 16 + 16 + 4 + 1 + 4;
+constexpr uint32_t kHeaderBytes = 32, kTrailerBytes = 4 + 16 + 16 + 4 + 1 + 2 + 4;
+// One laggy machine (todo item 11): see LagTarget(). Its delay may grow to this much time, and it carries up to
+// this many ticks of rollback for the others (its time sync lets it run that far "ahead").
+// In lockstep (no rollback to hide anything) the delay alone must cover the round trip: a higher limit.
+constexpr uint32_t kLaggyMaxDelayMs = 250, kLaggyMaxDelayLockstepMs = 450, kLaggyBudget = 4;
+// After a machine becomes laggy it waits this long before trusting its peers' laggy flags (they arrive a
+// one-way trip later; a peer on the same slow link is about to say it is laggy too).
+constexpr uint64_t kLaggySettleUsecs = 1500000;
+constexpr uint8_t kLagFlagLaggy = 1;
 constexpr uint32_t kRing = 1024;           // ticks of history kept per player
 // Frames per input packet, from the oldest tick the peer still needs (its ack) up to the newest.
 // With rollback a sender runs window + delay ticks ahead of what it has confirmed, and acks arrive
 // a round trip late; past this many frames the newest inputs wait for the acks to catch up, which
-// stalls both sides in bursts. 32 covers window 8 + delay 6 + a ~300 ms round trip.
-constexpr uint32_t kMaxFramesPerPacket = 32;
+// stalls both sides in bursts. 64 covers window 8 + a laggy machine's delay of up to 250 ms + a
+// ~400 ms round trip.
+constexpr uint32_t kMaxFramesPerPacket = 64;
 constexpr uint32_t kSyncRing = 64;
 constexpr uint32_t kSyncPerPacket = 4;
 constexpr uint32_t kNoTick = UINT32_MAX;
@@ -240,6 +252,8 @@ struct n64net_input {
     int32_t peer_advantage[N64NET_INPUT_MAX_PLAYERS] = {};
     bool peer_advantage_valid[N64NET_INPUT_MAX_PLAYERS] = {};
     uint32_t peer_wish_of[N64NET_INPUT_MAX_PLAYERS] = {};
+    bool peer_laggy[N64NET_INPUT_MAX_PLAYERS] = {};      // that machine says it is the laggy one
+    int32_t peer_delay_of[N64NET_INPUT_MAX_PLAYERS] = {-1, -1, -1, -1};  // its input delay (-1: unknown)
     int32_t remote_advantage = 0;      // the most-behind peer's advantage (time sync)
     bool remote_advantage_valid = false;
     int32_t ahead16 = 0;
@@ -262,6 +276,11 @@ struct n64net_input {
     n64net_input_stats stats = {};
     uint32_t rtt_samples[kRttRing] = {};
     uint32_t rtt_count = 0;
+    uint32_t rtt_of[N64NET_INPUT_MAX_PLAYERS][kRttRing] = {};   // per remote player (its machine)
+    uint32_t rtt_count_of[N64NET_INPUT_MAX_PLAYERS] = {};
+    bool laggy = false;          // this machine is the laggy one (hysteresis in UpdateAutoDelay)
+    uint64_t laggy_since = 0;
+    uint32_t lag_excess = 0;     // ticks of rollback this laggy machine carries for the others (time sync)
 
     // Auto delay (n64net_input_set_auto_delay).
     uint32_t auto_min = 0, auto_max = 0;  // 0/0 = off
@@ -337,23 +356,92 @@ struct n64net_input {
     // The delay this side wants: enough ticks to cover the one-way time of
     // the 90th percentile of recent round trips, less one tick (each side
     // polls once per tick), within [auto_min, auto_max]. 0 when off.
-    uint32_t Wish() const {
-        if (auto_max == 0) return 0;
-        const uint32_t n = std::min(rtt_count, kRttRing);
-        if (n < 8) return std::max(auto_min, delay);
+    // Ticks of delay that cover the one-way time from a set of round trips: the one-way time of their
+    // 90th percentile (half the round trip, less the frame of polling measured in it) plus 8 ms of
+    // margin, rounded up, plus one tick for the phase (the two frame clocks are up to a tick apart).
+    // (Proposed by the Mario Kart port.) 0 if there are fewer than 8 samples.
+    uint32_t OneWayTicks(const uint32_t *samples, uint32_t count) const {
+        const uint32_t n = std::min(count, kRttRing);
+        if (n < 8) return 0;
         uint32_t sorted[kRttRing];
-        std::copy(rtt_samples, rtt_samples + n, sorted);
+        std::copy(samples, samples + n, sorted);
         std::sort(sorted, sorted + n);
         const uint32_t p90 = sorted[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1];
         const uint32_t tick_usecs = 1000000u / cfg.ticks_per_second;
-        // An input for tick t leaves the peer at its tick t - delay and must
-        // arrive before our tick t starts; the two frame clocks are up to a
-        // tick out of phase. So: the one-way time (half the round trip, less
-        // the frame of polling measured in it) plus 8 ms of margin, rounded
-        // up, plus one tick for the phase. (Proposed by the Mario Kart port.)
         const uint32_t one_way = (p90 > tick_usecs ? p90 - tick_usecs : 0) / 2 + 8000;
-        const uint32_t ticks = (one_way + tick_usecs - 1) / tick_usecs + 1;
-        return std::min(std::max(ticks, auto_min), auto_max);
+        return (one_way + tick_usecs - 1) / tick_usecs + 1;
+    }
+    uint32_t OneWayTo(int p) const { return OneWayTicks(rtt_of[p], rtt_count_of[p]); }
+    // The machine's best link: the fewest ticks to any remote machine (0 = not measured yet). A machine whose
+    // best link needs more delay than the normal limit is "laggy": every one of its links is bad, so it, not
+    // its peers, should carry the lag.
+    uint32_t BestOneWay() const {
+        uint32_t best = 0;
+        for (int p = 0; p < cfg.num_players; p++) {
+            if (!IsRemote(p)) continue;
+            const uint32_t w = OneWayTo(p);
+            if (w && (best == 0 || w < best)) best = w;
+        }
+        return best;
+    }
+    uint32_t LaggyMaxDelay() const {
+        const uint32_t ms = cfg.rollback_window ? kLaggyMaxDelayMs : kLaggyMaxDelayLockstepMs;
+        return std::max(auto_max, (ms * cfg.ticks_per_second + 999) / 1000);
+    }
+    // The delay this side wants against its normal peers (the laggy ones carry their own lag), within
+    // [auto_min, auto_max]. 0 when off.
+    uint32_t Wish(bool with_laggy = false) const {
+        if (auto_max == 0) return 0;
+        uint32_t w = 0;
+        bool any = false;
+        for (int p = 0; p < cfg.num_players; p++) {
+            if (!IsRemote(p) || (peer_laggy[p] && !with_laggy)) continue;
+            const uint32_t t = OneWayTo(p);
+            if (t) any = true;
+            w = std::max(w, t);
+        }
+        if (!any && rtt_count < 8) return std::max(auto_min, delay);
+        return std::min(std::max(w, auto_min), auto_max);
+    }
+    // The laggy machine's delay: enough that each link to a normal peer works without anyone waiting, given
+    // that peer's own delay (the two delays together cover the round trip), less the rollback this machine
+    // carries itself; against another laggy machine each side covers its half. Within the laggy limit; what
+    // still isn't covered becomes extra rollback here (lag_excess, time sync), never a stall elsewhere.
+    // With no normal peer at all (two machines on one slow link, or everyone far apart) nobody is the odd one
+    // out: they share the lag as before (the usual wish, within max_delay).
+    uint32_t SharedTarget() const {
+        uint32_t peers = 0;
+        for (int p = 0; p < cfg.num_players; p++) {
+            if (IsRemote(p)) peers = std::max(peers, peer_wish_of[p]);
+        }
+        return std::min(std::max(Wish(true), peers), auto_max);
+    }
+    uint32_t LagTarget(uint32_t *excess, bool settled) const {
+        *excess = 0;
+        bool any_normal = false;
+        for (int p = 0; p < cfg.num_players; p++) {
+            any_normal |= IsRemote(p) && !peer_laggy[p] && OneWayTo(p) != 0;
+        }
+        if (!settled || !any_normal) return SharedTarget();
+        const uint32_t budget = std::min(kLaggyBudget, cfg.rollback_window / 2);
+        uint32_t need_normal = 0, need_laggy = 0;
+        for (int p = 0; p < cfg.num_players; p++) {
+            if (!IsRemote(p)) continue;
+            const uint32_t w = OneWayTo(p);
+            if (!w) continue;
+            if (peer_laggy[p]) {
+                need_laggy = std::max(need_laggy, std::min(w, auto_max));
+            } else {
+                const int32_t theirs = peer_delay_of[p] >= 0 ? peer_delay_of[p] : (int32_t)w;
+                need_normal = std::max<int32_t>(need_normal, (int32_t)(2 * w) - theirs);
+            }
+        }
+        const uint32_t want_normal = need_normal > budget ? need_normal - budget : 0;
+        const uint32_t target =
+            std::min(std::max({ want_normal, need_laggy, Wish() }), LaggyMaxDelay());
+        // the laggy machine runs ahead of its normal peers by everything their delays don't cover
+        *excess = need_normal > target ? std::min(need_normal - target, cfg.rollback_window ? cfg.rollback_window - 1 : 0) : 0;
+        return target;
     }
     void UpdateAutoDelay(uint64_t now);
     void SendInputs();
@@ -372,8 +460,30 @@ struct n64net_input {
 
 void n64net_input::UpdateAutoDelay(uint64_t now) {
     if (auto_max == 0) return;
-    // Both sides apply the larger wish, so the delay is the same both ways.
-    const uint32_t target = std::min(std::max(Wish(), peer_wish), auto_max);
+    // Laggy or not (with a tick of hysteresis so it doesn't flicker at the edge).
+    const uint32_t best = BestOneWay();
+    const bool was = laggy;
+    if (best && best > auto_max + (laggy ? 0 : 1)) {
+        if (!laggy) laggy_since = now;
+        laggy = true;
+    } else if (best && best < auto_max) {
+        laggy = false;
+    }
+    if (laggy != was) Log("n64net input: %s (best link %u ticks one way)\n",
+                          laggy ? "this machine's links are all slow: it takes the lag itself" : "links normal again",
+                          best);
+    uint32_t target;
+    if (laggy) {
+        target = LagTarget(&lag_excess, now - laggy_since >= kLaggySettleUsecs);
+    } else {
+        lag_excess = 0;
+        // Normal machines harmonise with the larger wish of their normal peers, so their delays match.
+        uint32_t peers = 0;
+        for (int p = 0; p < cfg.num_players; p++) {
+            if (IsRemote(p) && !peer_laggy[p]) peers = std::max(peers, peer_wish_of[p]);
+        }
+        target = std::min(std::max(Wish(), peers), auto_max);
+    }
     if (target > delay) {
         delay = target;  // up at once
         calm_since = now;
@@ -466,6 +576,8 @@ void n64net_input::SendInputsFor(int player) {
     }
     w.U32((uint32_t)LocalAdvantage());
     w.U8((uint8_t)std::min<uint32_t>(Wish(), 255));
+    w.U8(laggy ? kLagFlagLaggy : 0);
+    w.U8((uint8_t)std::min<uint32_t>(delay, 255));
     w.U32(Fnv(buf, (uint32_t)(w.p - buf)));
     Send(buf, (uint32_t)(w.p - buf));
 }
@@ -536,6 +648,9 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count, bool ri
     for (uint32_t &h : holds) h = r.U32();
     const int32_t advantage = (int32_t)r.U32();
     const uint8_t wish = r.U8();
+    const bool has_lag = r.p + 2 <= r.end;   // newer builds: lag flags + delay
+    const uint8_t lag_flags = has_lag ? r.U8() : 0;
+    const int32_t their_delay = has_lag ? (int32_t)r.U8() : -1;
     if (!r.ok) {
         stats.packets_dropped++;
         return;
@@ -549,12 +664,14 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count, bool ri
     peer_advantage[player] = advantage;
     peer_advantage_valid[player] = true;
     peer_wish_of[player] = wish;
+    peer_laggy[player] = (lag_flags & kLagFlagLaggy) != 0;
+    peer_delay_of[player] = their_delay;
     // aggregates over every peer: the most-behind advantage (time sync), the largest wish (auto delay)
     remote_advantage_valid = false;
     peer_wish = 0;
     for (int q = 0; q < cfg.num_players; q++) {
         if (!IsRemote(q)) continue;
-        peer_wish = std::max(peer_wish, peer_wish_of[q]);
+        if (!peer_laggy[q]) peer_wish = std::max(peer_wish, peer_wish_of[q]);
         if (!peer_advantage_valid[q]) continue;
         if (!remote_advantage_valid || peer_advantage[q] < remote_advantage) remote_advantage = peer_advantage[q];
         remote_advantage_valid = true;
@@ -564,6 +681,7 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count, bool ri
         const uint32_t rtt = (uint32_t)now - echo - hold;
         if (rtt < 10000000u) {
             rtt_samples[rtt_count++ % kRttRing] = rtt;
+            rtt_of[player][rtt_count_of[player]++ % kRttRing] = rtt;
             stats.rtt_max_usecs = std::max(stats.rtt_max_usecs, rtt);
         }
     }
@@ -712,6 +830,9 @@ void n64net_input::ApplyRetire(int p, uint32_t last, uint32_t apply, const uint8
     remote_mask &= ~(1u << p);
     peer_advantage_valid[p] = false;
     peer_wish_of[p] = 0;
+    peer_laggy[p] = false;
+    peer_delay_of[p] = -1;
+    rtt_count_of[p] = 0;
     Log("n64net input: player %d left: real inputs up to tick %d, the game changes it at tick %u\n", p + 1,
         last == kNoTick ? -1 : (int)last, apply);
 }
@@ -1337,7 +1458,9 @@ int n64net_timesync_should_skip(n64net_input *net) {
         net->timesync_cooldown--;
         return 0;
     }
-    if (net->ahead16 < 3 * 16) return 0;  // 1.5+ ticks ahead
+    // A laggy machine carries the rollback its peers' delays don't cover: it may run lag_excess ticks further
+    // ahead before it waits (its normal peers then never wait or roll back for it).
+    if (net->ahead16 < (3 + 2 * (int32_t)net->lag_excess) * 16) return 0;  // 1.5+ ticks ahead
     net->timesync_cooldown = net->cfg.ticks_per_second / 2;
     net->ahead16 -= 2 * 16;  // a skip closes the gap by one tick
     net->stats.timesync_skips++;
@@ -1398,6 +1521,9 @@ void n64net_input_get_stats(n64net_input *net, n64net_input_stats *out) {
     out->rtt_avg_usecs = n ? (uint32_t)(sum / n) : 0;
     out->local_advantage = net->LocalAdvantage();
     out->remote_advantage = net->remote_advantage;
+    out->input_delay = net->delay;
+    out->laggy = net->laggy ? 1 : 0;
+    out->lag_excess = net->lag_excess;
 }
 
 int n64net_rollback_frame(n64net_input *net, uint32_t tick, const n64net_rollback_callbacks *cb) {

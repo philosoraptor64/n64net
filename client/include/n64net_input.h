@@ -207,10 +207,17 @@ void n64net_input_set_delay(n64net_input *net, uint32_t input_delay);
 
 /* Automatic input delay: each side wishes for enough delay to cover the
  * one-way time of the 90th percentile of recent round trips plus 8 ms, plus
- * one tick for the frame phase, within [min_delay, max_delay]; both apply the larger of the two wishes, up
+ * one tick for the frame phase, within [min_delay, max_delay]; machines apply the larger of their wishes, up
  * at once, down one tick after 8 calm seconds. max_delay 0 turns it off. In
  * lockstep this trades a little input lag for far fewer stalls; with
- * rollback, keep max_delay low (rollback hides the rest). */
+ * rollback, keep max_delay low (rollback hides the rest).
+ *
+ * One laggy machine doesn't slow the others: a machine whose every link needs more than max_delay (even its
+ * best one) counts as laggy and says so in its packets. Its normal peers then leave it out of their wishes
+ * and keep their own delay. The laggy machine takes a larger delay of its own (up to 250 ms), enough that its
+ * delay plus each peer's covers their round trip, less up to 4 ticks of rollback it carries itself (its time
+ * sync lets it run ahead by that much). So the others neither wait for it nor roll back for it; only its player
+ * feels the lag. Between two machines (both laggy) each side covers half, as before. */
 void n64net_input_set_auto_delay(n64net_input *net, uint32_t min_delay, uint32_t max_delay);
 uint32_t n64net_input_get_delay(n64net_input *net);
 
@@ -248,6 +255,9 @@ typedef struct n64net_input_stats {
     uint32_t rtt_avg_usecs, rtt_max_usecs;   /* recent round trips */
     int32_t local_advantage, remote_advantage;
     uint32_t timesync_skips;
+    uint32_t input_delay;    /* this machine's input delay now (ticks) */
+    uint32_t laggy;          /* 1: this machine's links are all slow, it takes the lag itself */
+    uint32_t lag_excess;     /* ticks of rollback the laggy machine carries beyond its delay */
 } n64net_input_stats;
 void n64net_input_get_stats(n64net_input *net, n64net_input_stats *out);
 
