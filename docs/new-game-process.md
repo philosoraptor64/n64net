@@ -163,9 +163,18 @@ the message; a peer quitting ends the other cleanly.
 - Snapshots of the whole simulation (game RAM + runtime/port state), a ring of 12-16 slots; prediction +
   silent re-simulation; lockstep where re-simulation is unsafe (loading, scene changes); time sync; adaptive
   input delay; saves reach disk only for confirmed frames.
+- **Rollback in the menus too, not only in matches** (owner's list, 2026-11-17, item 10: rollback for all parts of all
+  games; lockstep menus stutter online). Title, file select, character/stage select, options and results
+  roll back like gameplay. Lockstep only for the frames that really can't re-run: loads, scene/stage changes
+  (settle them with confirmed inputs, then reopen the window), and anything that writes outside the snapshot.
+- **Run SyncTest through the menus**, not just a match. Menus find bugs matches don't: GoldenEye's file select
+  decoded textures from uninitialized stack, and its EEPROM image was outside the snapshot. Zero the stack
+  buffers in the port, and keep save memory (EEPROM/SRAM/pak) in the snapshot.
+- Menu code often reads the clock (osGetCount, animation timers): force the synthetic counter online.
 
-**Gate 8 (numbers):** SyncTest 0 mismatches over a full match; pair test at 60 ms + 30 ms jitter + 4% loss in
-sync with rollbacks happening; snapshot save/load < 1 ms on a Mac; no stalls on a clean link.
+**Gate 8 (numbers):** SyncTest 0 mismatches from boot through the title and every menu into a full match and
+back to the menus; pair test at 60 ms + 30 ms jitter + 4% loss in
+sync with rollbacks happening in the menus and in play; snapshot save/load < 1 ms on a Mac; no stalls on a clean link.
 
 ## Players and devices (up to 4): design every stage for it
 
