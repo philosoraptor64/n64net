@@ -197,6 +197,19 @@ int n64net_peek_rollback(n64net_input *net, uint32_t *tick);
  * menus and rollback battles in one session. */
 void n64net_input_set_window(n64net_input *net, uint32_t rollback_window);
 
+/* --- Deep window (added 2026-11-18) ------------------------------------------
+ * Guess through network spikes instead of waiting (the game, and its music, keep going): while rollback is on,
+ * the window may grow from the one set with n64net_input_set_window up to max_window, as far as replays stay
+ * within budget_usecs per frame. The game reports how long its replays take (n64net_input_note_replay; the
+ * rollback driver does it itself) and the library allows window = budget / (cost of one replayed tick), so a
+ * slow device or an expensive game gets less depth instead of spiralling into replays every frame. Until a
+ * replay was measured, the base window applies. max_window 0 = off. */
+void n64net_input_set_deep_window(n64net_input *net, uint32_t max_window, uint32_t budget_usecs);
+/* A replay of `ticks` ticks took `usecs` (the game's own rollback code; the driver reports its own). */
+void n64net_input_note_replay(n64net_input *net, uint32_t ticks, uint64_t usecs);
+/* The window n64net_input_ready uses now (the base, or the deep one). */
+uint32_t n64net_input_window(n64net_input *net);
+
 /* Highest tick whose inputs are all confirmed (UINT32_MAX before any). */
 uint32_t n64net_input_confirmed_tick(n64net_input *net);
 

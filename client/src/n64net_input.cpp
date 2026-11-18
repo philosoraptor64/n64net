@@ -282,6 +282,14 @@ struct n64net_input {
     bool laggy = false;          // this machine is the laggy one (hysteresis in UpdateAutoDelay)
     uint64_t laggy_since = 0;
     uint32_t lag_excess = 0;     // ticks of rollback this laggy machine carries for the others (time sync)
+    uint32_t deep_max = 0, deep_budget = 0;   // n64net_input_set_deep_window
+    double replay_tick_usecs = 0;             // smoothed cost of one replayed tick (0 = not measured yet)
+    uint32_t Window() const {
+        const uint32_t base = cfg.rollback_window;
+        if (base == 0 || deep_max <= base || replay_tick_usecs <= 0) return base;
+        const double fit = deep_budget / replay_tick_usecs;
+        return (uint32_t)std::max<double>(base, std::min<double>(deep_max, fit));
+    }
 
     // Auto delay (n64net_input_set_auto_delay).
     uint32_t auto_min = 0, auto_max = 0;  // 0/0 = off
@@ -1268,7 +1276,7 @@ int n64net_input_ready(n64net_input *net, uint32_t tick) {
     const uint32_t needed = net->MinNextNeeded();
     if (needed == kNoTick) return 1;  // no remote players
     // Confirmed up to needed - 1; ready if that is >= tick - window.
-    return (uint64_t)needed + net->cfg.rollback_window >= (uint64_t)tick + 1 ? 1 : 0;
+    return (uint64_t)needed + net->Window() >= (uint64_t)tick + 1 ? 1 : 0;
 }
 
 int n64net_input_get(n64net_input *net, int player, uint32_t tick, n64net_pad *out) {
@@ -1453,6 +1461,22 @@ void n64net_input_set_auto_delay(n64net_input *net, uint32_t min_delay, uint32_t
 
 uint32_t n64net_input_get_delay(n64net_input *net) { return net->delay; }
 
+void n64net_input_set_deep_window(n64net_input *net, uint32_t max_window, uint32_t budget_usecs) {
+    net->deep_max = max_window;
+    net->deep_budget = budget_usecs;
+}
+
+void n64net_input_note_replay(n64net_input *net, uint32_t ticks, uint64_t usecs) {
+    if (ticks == 0) return;
+    const double per = (double)usecs / ticks;
+    // smoothed, but up at once (a slow replay must shrink the window before the next one)
+    net->replay_tick_usecs = net->replay_tick_usecs <= 0 || per > net->replay_tick_usecs
+                                 ? per
+                                 : net->replay_tick_usecs * 0.9 + per * 0.1;
+}
+
+uint32_t n64net_input_window(n64net_input *net) { return net->Window(); }
+
 int n64net_timesync_should_skip(n64net_input *net) {
     if (net->cfg.rollback_window == 0 || !net->remote_advantage_valid || net->CatchingUp()) return 0;
     // Twice the ticks we run ahead (our advantage minus the peer's), smoothed
@@ -1571,6 +1595,7 @@ int n64net_rollback_frame(n64net_input *net, uint32_t tick, const n64net_rollbac
             depth = -1;
         } else {
             net->driver_tick = from;
+            const uint64_t replay_start = net->Now();
             cb->load(cb->user, slot);
             net->resimulating = 1;
             for (uint32_t t = from; t < tick; t++) {
@@ -1580,6 +1605,7 @@ int n64net_rollback_frame(n64net_input *net, uint32_t tick, const n64net_rollbac
             }
             net->resimulating = 0;
             depth = (int)(tick - from);
+            n64net_input_note_replay(net, (uint32_t)depth, net->Now() - replay_start);
             net->stats.rollbacks++;
         }
     }
