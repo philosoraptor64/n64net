@@ -1533,23 +1533,49 @@ void n64net_input_get_stats(n64net_input *net, n64net_input_stats *out) {
 
 int n64net_rollback_frame(n64net_input *net, uint32_t tick, const n64net_rollback_callbacks *cb) {
     const uint32_t n = cb->slot_count;
-    if (net->slot_tick.size() != n) net->slot_tick.assign(n, kNoTick);
+    const bool anchored = cb->swap != nullptr;
+    const uint32_t A = n;   // the anchor's slot (with swap)
+    if (net->slot_tick.size() != n + 1) net->slot_tick.assign(n + 1, kNoTick);
+    // Save the state before tick t into its ring slot. The state there before (an older tick) may still be needed
+    // by a rollback (a deep window): keep it as the anchor when the anchor would otherwise not lie at or before
+    // every tick a rollback can start at (the first unconfirmed one), or when it is a newer such state.
+    auto save = [&](uint32_t t) {
+        const uint32_t k = t % n;
+        uint32_t &anchor = net->slot_tick[A];
+        if (anchor != kNoTick && anchor >= t) anchor = kNoTick;   // from a timeline being replaced
+        const uint32_t s = net->slot_tick[k];
+        if (anchored && s != kNoTick && s != t && s < t) {
+            const uint32_t c = n64net_input_confirmed_tick(net);
+            const uint32_t need = c == kNoTick ? 0 : c + 1;
+            if (anchor == kNoTick || (anchor > need && s < anchor) || (s <= need && s > anchor)) {
+                cb->swap(cb->user, k, A);
+                anchor = s;
+                net->slot_tick[k] = kNoTick;
+            }
+        }
+        cb->save(cb->user, k);
+        net->slot_tick[k] = t;
+    };
     int depth = 0;
     uint32_t from;
     if (n64net_take_rollback(net, &from) && from < tick) {
-        if (net->slot_tick[from % n] != from) {
+        uint32_t slot = kNoTick;
+        if (net->slot_tick[from % n] == from) {
+            slot = from % n;
+        } else if (anchored && net->slot_tick[A] != kNoTick && net->slot_tick[A] <= from) {
+            slot = A;                // older than the ring: replay from the anchor
+            from = net->slot_tick[A];
+        }
+        if (slot == kNoTick) {
             net->Log("n64net input: cannot roll back to tick %u from %u: state too old\n", from, tick);
             depth = -1;
         } else {
             net->driver_tick = from;
-            cb->load(cb->user, from % n);
+            cb->load(cb->user, slot);
             net->resimulating = 1;
             for (uint32_t t = from; t < tick; t++) {
                 net->driver_tick = t;
-                if (t != from) {
-                    cb->save(cb->user, t % n);
-                    net->slot_tick[t % n] = t;
-                }
+                if (t != from) save(t);
                 cb->advance(cb->user);
             }
             net->resimulating = 0;
@@ -1558,8 +1584,7 @@ int n64net_rollback_frame(n64net_input *net, uint32_t tick, const n64net_rollbac
         }
     }
     net->driver_tick = tick;
-    cb->save(cb->user, tick % n);
-    net->slot_tick[tick % n] = tick;
+    save(tick);
     return depth;
 }
 

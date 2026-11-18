@@ -59,7 +59,7 @@ struct M {
     bool sampled = false;
     uint64_t state = 0;
     std::vector<uint64_t> hist = std::vector<uint64_t>(kTicks + 64);
-    uint64_t ring[kSlots] = {};
+    uint64_t ring[kSlots + 1] = {};   // + the anchor (deep-window runs)
     uint32_t frames = 0, stalls = 0, skips = 0, resim = 0;
     uint32_t max_delay = 0;
     bool in_resim = false;
@@ -81,6 +81,10 @@ void Load(void *u, uint32_t slot) {
     m.tick = n64net_rollback_callback_tick(m.net);
 }
 void Advance(void *u) { M &m = *(M *)u; m.resim++; Step(m); }
+void Swap(void *u, uint32_t a, uint32_t b) { M &m = *(M *)u; std::swap(m.ring[a], m.ring[b]); }
+uint32_t g_slots = kSlots;     // ring size for the rollback driver
+bool g_swap = false;           // give it the anchor (swap)
+uint32_t g_max_delay_rb = 3;   // auto delay ceiling with rollback
 
 struct Result { uint32_t stalls, skips, resim, frames, delay; bool same; };
 
@@ -106,9 +110,9 @@ bool Run(const char *name, int n, int laggy, uint32_t fast_ms, uint32_t slow_ms,
         c.user = (void *)(intptr_t)i;
         c.now_usecs = Now;
         g_m[i].net = n64net_input_create(&c);
-        n64net_input_set_auto_delay(g_m[i].net, 1, window ? 3 : 6);
+        n64net_input_set_auto_delay(g_m[i].net, 1, window ? g_max_delay_rb : 6);
     }
-    const n64net_rollback_callbacks cb0 = { Save, Load, Advance, nullptr, kSlots };
+    const n64net_rollback_callbacks cb0 = { Save, Load, Advance, nullptr, g_slots, g_swap ? Swap : nullptr };
     uint64_t next_frame[kMax];
     for (int i = 0; i < n; i++) next_frame[i] = (uint64_t)i * 4100;   // frame clocks out of phase
     for (uint64_t step = 0; step < 4000000; step++) {
@@ -218,6 +222,19 @@ int main() {
                                                                        (double)r[0].resim / r[0].frames < 1.5);
     check("uplink: the laggy machine doesn't stall either", r[2].stalls <= 60);
     g_uplink_only = false;
+    // a deep window (40) with a 12-slot ring and the anchor: spikes are guessed through, nothing waits
+    g_slots = 12;
+    g_swap = true;
+    g_jitter_ms = 600;   // spiky: inputs up to ~0.6 s late now and then
+    g_loss = 5;
+    ok &= Run("3 machines, spiky network, deep window + anchor", 3, -1, 60, 60, 40, r);
+    check("deep window: states identical, few stalls", r[0].same && r[0].stalls <= 30 && r[1].stalls <= 30 &&
+                                                          r[2].stalls <= 30);
+    g_slots = kSlots;
+    g_swap = false;
+    ok &= Run("3 machines, spiky network, window 8 (for comparison)", 3, -1, 60, 60, 8, r);
+    g_jitter_ms = 10;
+    g_loss = 1;
     ok &= Run("2 machines on a slow link", 2, -1, 150, 150, 8, r);
     check("2 machines: the same delay on both sides", r[0].delay == r[1].delay);
     ok &= Run("4 machines, all normal", 4, -1, 25, 25, 8, r);

@@ -269,7 +269,8 @@ void n64net_input_get_stats(n64net_input *net, n64net_input_stats *out);
  * the way; then it saves the state before `tick`. advance() must run one game
  * tick (reading inputs with n64net_input_get, without drawing or sound) and
  * move the game's tick forward. Slots are tick % slot_count; slot_count must
- * exceed rollback_window + input_delay. Returns the rollback depth (0 = none),
+ * exceed rollback_window + input_delay, unless swap is given (the anchor, see below). Returns the rollback
+ * depth (0 = none, counted from where the replay started),
  * or -1 if the needed state was older than the ring (the peers may now differ). */
 typedef struct n64net_rollback_callbacks {
     void (*save)(void *user, uint32_t slot);
@@ -277,6 +278,13 @@ typedef struct n64net_rollback_callbacks {
     void (*advance)(void *user);
     void *user;
     uint32_t slot_count;
+    /* Optional (added 2026-11-18; zero-fill the struct): exchange the contents of slots a and b, cheaply (swap
+     * buffer pointers). With it the driver keeps one more snapshot, the anchor, in slot slot_count (so the game
+     * provides slot_count + 1 slots): when the ring is about to overwrite a state a rollback might still need,
+     * that state is swapped into the anchor. A rollback older than the ring then loads the anchor and replays
+     * from it, so rollback_window may exceed slot_count: a deep window (e.g. 40) lets a game guess through a
+     * network spike instead of waiting (its music keeps playing), with a ring of normal size. */
+    void (*swap)(void *user, uint32_t a, uint32_t b);
 } n64net_rollback_callbacks;
 int n64net_rollback_frame(n64net_input *net, uint32_t tick, const n64net_rollback_callbacks *callbacks);
 /* Inside a save/load/advance callback: the tick it is about (save/load: the
