@@ -35,7 +35,8 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
     ERR version <host_build>             same game, different build (see below)
     MEMBER <code> <index> <public_ip:port> <lan_ip:port> <your_index> <your_token>
                                          (rooms for up to 4) one other member; index 0 = host
-    LEFT <code> <index>                  (rooms for up to 4) that member left (BYE or idle)
+    LEFT <code> <index>                  (rooms for up to 4) that member left (BYE, or its MOVE
+                                         keepalives stopped for MEMBER_IDLE_SECS)
 
 Rooms for up to 4 machines (HOSTN): the host is member 0, each JOINN takes the
 lowest free index 1-3. On every join the server introduces every pair: each
@@ -128,6 +129,8 @@ AUTH_WINDOW_SECS = 300      # allowed clock difference
 AUTH_MAX_FAILURES = 10      # per address within AUTH_BAN_SECS ...
 AUTH_BAN_SECS = 600         # ... then that address is ignored this long
 MATCH_VERSION = "M1"
+MEMBER_IDLE_SECS = 150      # rooms for up to 4: a member (not the host) whose MOVE keepalives (~1/min) stopped
+                            # this long ago is dropped and the others get LEFT (a stale copy no longer lingers)
 PRESENCE_SECS = 90          # forget a device this long after its last PRES/SEEK
 SEEK_SECS = 12              # a seeker that stopped repeating SEEK is dropped
 MATCH_HOLD_SECS = 60        # a paired code is held for its host; MATCH is repeated to both meanwhile
@@ -164,6 +167,8 @@ class Member:
         self.addr = addr
         self.lan = lan
         self.token = secrets.token_hex(8)
+        self.seen = time.monotonic()
+        self.keepalive = False   # it sends MOVE about once a minute: it may time out (MEMBER_IDLE_SECS)
 
 
 class Person:
@@ -467,6 +472,7 @@ class Rendezvous(asyncio.DatagramProtocol):
             log.info("room %s joined by %s as member %d", room.code, fmt_addr(addr), idx)
         else:
             room.members[idx].lan = lan
+            room.members[idx].seen = time.monotonic()   # a repeated JOINN counts as a keepalive too
         room.touched = time.monotonic()
         self.by_addr[addr] = room
         self.send_members(room)
@@ -584,6 +590,8 @@ class Rendezvous(asyncio.DatagramProtocol):
             return
         m = room.members[idx]
         room.touched = time.monotonic()
+        m.seen = room.touched
+        m.keepalive = True
         moved = m.addr != addr
         if moved:
             if self.by_addr.get(m.addr) is room:
@@ -776,6 +784,12 @@ class Rendezvous(asyncio.DatagramProtocol):
             limit = RELAY_IDLE_SECS if room.relay else ROOM_IDLE_SECS
             if now - room.touched > limit:
                 self.drop_room(room, "idle")
+                continue
+            if room.multi and not room.legacy:
+                for i in range(1, MAX_MEMBERS):
+                    m = room.members[i]
+                    if m is not None and m.keepalive and now - m.seen > MEMBER_IDLE_SECS:
+                        self.drop_member(room, i, "no keepalive for %d s" % int(now - m.seen))
         for d, p in list(self.people.items()):
             if now - p.seen > PRESENCE_SECS:
                 del self.people[d]
@@ -864,8 +878,11 @@ async def main():
     ap.add_argument("--password-file", help="file whose first line is the server password")
     ap.add_argument("--natpmp", action="store_true",
                     help="ask the home router (NAT-PMP) to forward the port while running")
+    ap.add_argument("--member-idle-secs", type=int, default=MEMBER_IDLE_SECS,
+                    help="drop a room member whose keepalives stopped this long ago (default %(default)s)")
     ap.add_argument("-v", "--verbose", action="store_true")
     opts = ap.parse_args()
+    globals()["MEMBER_IDLE_SECS"] = max(1, opts.member_idle_secs)
     logging.basicConfig(level=logging.DEBUG if opts.verbose else logging.INFO,
                         format="%(asctime)s %(message)s")
     password = None
@@ -895,7 +912,7 @@ async def main():
             log.warning("--natpmp: no default gateway found")
     try:
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(min(10, max(1, MEMBER_IDLE_SECS // 4)))
             proto.expire()
     finally:
         if mapper is not None:

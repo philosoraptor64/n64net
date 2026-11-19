@@ -147,6 +147,39 @@ def main():
     finally:
         srv.terminate()
         srv.wait(timeout=5)
+
+    # 8. a member whose keepalives (MOVE) stop is dropped after --member-idle-secs; one that never sent any
+    #    (an older client) stays until the room itself goes idle
+    port2 = 7798
+    srv = subprocess.Popen([sys.executable, os.path.join(HERE, "rendezvous.py"), "--port", str(port2), "--bind",
+                            "127.0.0.1", "--password-file", pwfile.name, "--member-idle-secs", "2"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.8)
+    try:
+        G = "game+1"
+        d = [Client(port2) for _ in range(3)]
+        d[0].cmd("HOSTN", [G, "DDDD", d[0].lan()])
+        d[0].recv_all()
+        toks = {}
+        for i in (1, 2):
+            d[i].cmd("JOINN", [G, "DDDD", d[i].lan()])
+            for t in texts(d[i].recv_all(0.6)):
+                p = t.split()
+                if p[0] == "MEMBER":
+                    toks[i] = p[6]
+        d[1].cmd("MOVE", ["DDDD", "guest", toks[1]], signed=False)   # member 1: a keepalive client, then silent
+        d[1].recv_all()
+        d[0].recv_all()
+        heard = []
+        end = time.time() + 7
+        while time.time() < end and not any(t == "LEFT DDDD 1" for t in heard):
+            d[0].cmd("HOSTN", [G, "DDDD", d[0].lan()])                # the host keeps the room alive
+            heard += texts(d[0].recv_all(0.5))
+        check("silent keepalive member: LEFT after the idle time", "LEFT DDDD 1" in heard, str(heard))
+        check("member that never sent keepalives stays", "LEFT DDDD 2" not in heard, str(heard))
+    finally:
+        srv.terminate()
+        srv.wait(timeout=5)
         os.unlink(pwfile.name)
     print("ALL PASS" if not failures else f"{len(failures)} FAILED")
     return 0 if not failures else 1
