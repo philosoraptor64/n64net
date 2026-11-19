@@ -276,6 +276,7 @@ struct n64net_input {
 
     n64net_input_stats stats = {};
     uint32_t rtt_samples[kRttRing] = {};
+    uint32_t rtt_valid_from = 0;   // the joiner: our stamp when catching up ended (older round trips don't count)
     uint32_t rtt_count = 0;
     uint32_t rtt_of[N64NET_INPUT_MAX_PLAYERS][kRttRing] = {};   // per remote player (its machine)
     uint32_t rtt_count_of[N64NET_INPUT_MAX_PLAYERS] = {};
@@ -690,7 +691,11 @@ void n64net_input::HandleInput(Reader &r, uint8_t player, uint8_t count, bool ri
         remote_advantage_valid = true;
     }
     const uint32_t echo = echoes[cfg.local_player], hold = holds[cfg.local_player];
-    if (echo != 0) {
+    // The joiner counts no round trip that started before the host's log had all arrived: its packets and the
+    // host's queue behind the log (seconds), and those samples would set its auto delay (seen: 15 ticks after
+    // GoldenEye caught up, coming down a tick every 8 s) and call it laggy.
+    if (cfg.joining && CatchingUp()) rtt_valid_from = (uint32_t)now;
+    if (echo != 0 && !(cfg.joining && (int32_t)(echo - rtt_valid_from) < 0)) {
         const uint32_t rtt = (uint32_t)now - echo - hold;
         if (rtt < 10000000u) {
             rtt_samples[rtt_count++ % kRttRing] = rtt;
@@ -1203,7 +1208,9 @@ void n64net_input::SetLocalPads(uint32_t tick, const n64net_pad *pads) {
             if (IsLocal(p)) last_pad[p] = pads[p];
         }
         last_sample_tick = tick;
-        SendInputs();
+        // Fast-forwarding plays thousands of ticks a second: sending on each one floods the link (in i64 its
+        // packets queued for seconds behind each other). Nothing in them is new each tick, so 100 a second do.
+        if (Now() - last_send_usecs >= 10000) SendInputs();
         return;
     }
     if (!local_started) {
