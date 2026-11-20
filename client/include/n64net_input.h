@@ -147,7 +147,7 @@ int n64net_input_retired(n64net_input *net, int player, uint32_t *last_tick, uin
  *  - Every machine's game asks n64net_input_rejoined() each tick and makes the players human again at
  *    that tick (the reverse of the retirement's change; also in a resimulation). Until then the
  *    players stay what the retirement made them, also on the joiner while it catches up.
- * Returns 1, or 0 if a player in mask isn't retired, a join is already under way, or this is the joiner. */
+ * Returns 1, or 0 if a player in mask isn't retired or already joining, or this is the joiner. */
 int n64net_input_admit(n64net_input *net, uint32_t player_mask);
 /* The joiner: 1 until it has played up to the tick its players go live at (fast-forward). */
 /* Joining into a player nobody has played so far (a CPU since the start, an empty slot: on every machine in
@@ -160,11 +160,14 @@ int n64net_input_admit(n64net_input *net, uint32_t player_mask);
  * remote_mask explicitly (0 means "everyone not local", which would count the open players as remote). */
 int n64net_input_add(n64net_input *net, uint32_t player_mask);
 int n64net_input_catching_up(n64net_input *net);
-/* Watching first (added 2026-11-19): the host calls n64net_input_hold_join(net, 1) before n64net_input_admit/add
- * to keep the joiner watching. It gets the log as usual and plays along, but no live tick is announced (its
- * players stay CPUs or idle) until the host calls n64net_input_hold_join(net, 0), e.g. once the host's player
- * agreed. n64net_input_admit(net, 0) cancels a held join (the watcher left). */
-void n64net_input_hold_join(n64net_input *net, int hold);
+/* Watching first (added 2026-11-19): the host calls n64net_input_hold_join(net, mask, 1) before
+ * n64net_input_admit/add for those players to keep that joiner watching. It gets the log as usual and plays
+ * along, but no live tick is announced (its players stay CPUs or idle) until the host calls
+ * n64net_input_hold_join(net, mask, 0), e.g. once the host's player agreed. n64net_input_cancel_join(net, mask)
+ * drops a join whose live tick isn't announced yet (the joiner left); n64net_input_admit(net, 0) drops all such.
+ * Several joiners may be served at once (each with its own players). */
+void n64net_input_hold_join(n64net_input *net, uint32_t player_mask, int hold);
+int n64net_input_cancel_join(n64net_input *net, uint32_t player_mask);
 /* The joiner: 1 if `tick` should be played fast-forward (not paced, drawn or heard): before the live tick, or,
  * while it isn't known (a held join), only when far behind the log's end; 0 = play it normally (watching, or
  * live). A machine that isn't joining always gets 0. */
