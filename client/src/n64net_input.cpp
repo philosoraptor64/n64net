@@ -48,6 +48,9 @@ constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3, k
 // Joining a running match: the host streams the log to the joiner, up to this many packets per send; when the
 // joiner has all but kJoinNear ticks of it, the players go live kJoinMargin ticks after the host's newest tick.
 constexpr uint32_t kLogPacketsPerSend = 16, kJoinNear = 60, kJoinMargin = 45;
+// A joiner watching (the live tick not known yet) plays paced while within kWatchNear ticks of the log's end and
+// fast-forwards again once more than kWatchFar behind (n64net_input_fast_forward).
+constexpr uint32_t kWatchNear = 8, kWatchFar = 90;
 constexpr uint32_t kRejoinRepeats = 200;
 constexpr uint32_t kRetireTail = 64;      // the leaver's last inputs carried in a RETIRE packet
 constexpr uint32_t kRetireRepeats = 200;  // RETIRE packets sent with the next inputs (UDP: no ack needed)
@@ -223,11 +226,13 @@ struct n64net_input {
     uint32_t admit_sent = 0;        // next log tick to send
     uint64_t admit_progress_at = 0; // when admit_have last grew
     bool admit_heard = false;       // its game runs (a "have" arrived): until then one piece now and then
+    bool admit_hold = false;        // n64net_input_hold_join: the joiner watches; no live tick until let in
     void ServeJoiner();
     void SendLog(uint32_t first, uint32_t *next);
     // the joiner
     uint32_t live_from = kNoTick;   // its players' first live tick (kNoTick: not known yet)
     uint32_t local_base = 0;        // the first tick of its local streams (start_tick, or live_from)
+    bool fast_forward = true;       // n64net_input_fast_forward's last answer before the live tick is known
     // pieces of the log that arrived ahead of a missing one (first tick -> pads, events)
     struct Piece { std::vector<n64net_pad> pads; std::vector<LogEvent> events; bool ext; };
     std::map<uint32_t, Piece> log_ahead;
@@ -1095,7 +1100,7 @@ void n64net_input::ServeJoiner() {
         return;
     }
     for (uint32_t k = 0; k < kLogPacketsPerSend && admit_sent < log_end; k++) SendLog(admit_sent, &admit_sent);
-    if (rejoin_tick == kNoTick && log_end - std::min(admit_have, log_end) <= kJoinNear) {
+    if (rejoin_tick == kNoTick && !admit_hold && log_end - std::min(admit_have, log_end) <= kJoinNear) {
         uint32_t live = std::max(highest_got, last_sample_tick + 1);
         live = std::max(live, local_started ? local_last + 1 : local_base);
         live += kJoinMargin;
@@ -1664,7 +1669,11 @@ int n64net_input_remote_players(n64net_input *net) { return net ? (int)__builtin
 int n64net_input_admit(n64net_input *net, uint32_t player_mask) {
     if (!net || net->cfg.joining) return 0;
     if (player_mask == 0) {   // cancel (the joiner went away before its live tick was announced)
-        if (net->rejoin_tick == kNoTick || !net->admit_mask) net->admit_mask = 0;
+        if (net->rejoin_tick == kNoTick || !net->admit_mask) {
+            if (net->admit_mask) net->Log("n64net input: the join of players %x is cancelled\n", net->admit_mask);
+            net->admit_mask = 0;
+            net->admit_hold = false;
+        }
         return 1;
     }
     if (net->admit_mask) return 0;
@@ -1708,6 +1717,26 @@ int n64net_input_add(n64net_input *net, uint32_t player_mask) {
 }
 
 int n64net_input_catching_up(n64net_input *net) { return net && net->CatchingUp() ? 1 : 0; }
+
+void n64net_input_hold_join(n64net_input *net, int hold) {
+    if (!net || net->cfg.joining || net->admit_hold == (hold != 0)) return;
+    net->admit_hold = hold != 0;
+    if (net->admit_mask) {
+        net->Log(hold ? "n64net input: the joiner (players %x) watches until it is let in\n"
+                      : "n64net input: the joiner (players %x) is let in\n", net->admit_mask);
+    }
+    if (!hold) net->ServeJoiner();
+}
+
+int n64net_input_fast_forward(n64net_input *net, uint32_t tick) {
+    if (!net || !net->cfg.joining) return 0;
+    if (net->live_from != kNoTick) return tick < net->live_from ? 1 : 0;
+    // the live tick isn't known (the host may hold the join): play paced near the end of the log, else hurry
+    const uint32_t gap = net->log_end > tick ? net->log_end - tick : 0;
+    if (gap > kWatchFar) net->fast_forward = true;
+    else if (gap <= kWatchNear) net->fast_forward = false;
+    return net->fast_forward ? 1 : 0;
+}
 
 int n64net_input_rejoined(n64net_input *net, int player, uint32_t *tick) {
     if (!net || player < 0 || player >= N64NET_INPUT_MAX_PLAYERS || net->join_from[player] == kNoTick) return 0;

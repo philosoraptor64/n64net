@@ -160,6 +160,15 @@ int n64net_input_admit(n64net_input *net, uint32_t player_mask);
  * remote_mask explicitly (0 means "everyone not local", which would count the open players as remote). */
 int n64net_input_add(n64net_input *net, uint32_t player_mask);
 int n64net_input_catching_up(n64net_input *net);
+/* Watching first (added 2026-11-19): the host calls n64net_input_hold_join(net, 1) before n64net_input_admit/add
+ * to keep the joiner watching. It gets the log as usual and plays along, but no live tick is announced (its
+ * players stay CPUs or idle) until the host calls n64net_input_hold_join(net, 0), e.g. once the host's player
+ * agreed. n64net_input_admit(net, 0) cancels a held join (the watcher left). */
+void n64net_input_hold_join(n64net_input *net, int hold);
+/* The joiner: 1 if `tick` should be played fast-forward (not paced, drawn or heard): before the live tick, or,
+ * while it isn't known (a held join), only when far behind the log's end; 0 = play it normally (watching, or
+ * live). A machine that isn't joining always gets 0. */
+int n64net_input_fast_forward(n64net_input *net, uint32_t tick);
 /* 1 if `player` is human again (a joiner took it over) from *tick on. */
 int n64net_input_rejoined(n64net_input *net, int player, uint32_t *tick);
 /* Ticks in this machine's input log (the joiner: how much of the host's log has arrived) and the live tick
