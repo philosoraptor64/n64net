@@ -35,8 +35,16 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
     ERR version <host_build>             same game, different build (see below)
     MEMBER <code> <index> <public_ip:port> <lan_ip:port> <your_index> <your_token>
                                          (rooms for up to 4) one other member; index 0 = host
-    LEFT <code> <index>                  (rooms for up to 4) that member left (BYE, or its MOVE
-                                         keepalives stopped for MEMBER_IDLE_SECS)
+    LEFT <code> <index>                  (rooms for up to 4) that member left (BYE, GONE, KICK, or its
+                                         MOVE keepalives stopped for MEMBER_IDLE_SECS)
+
+Ghosts (rooms for up to 4; authorised by move tokens, like MOVE, so no password needed):
+  client -> server
+    GONE <code> <token>                  the member holding that token is gone: sent by a relaunched app
+                                         for its crashed copy (it kept the token). The host's token
+                                         closes the room. Answers GONEOK <code>.
+    KICK <code> <host_token> <index>     the host removes a member that failed its presence check (or
+                                         came back as a new member). Answers KICKOK <code> <index>.
 
 Rooms for up to 4 machines (HOSTN): the host is member 0, each JOINN takes the
 lowest free index 1-3. On every join the server introduces every pair: each
@@ -621,6 +629,35 @@ class Rendezvous(asyncio.DatagramProtocol):
                     self.drop_member(room, idx, "bye")
                     return
             self.drop_room(room, "bye")
+
+    def cmd_GONE(self, addr, args):
+        code, token = args[0].upper(), args[1]
+        room = self.rooms.get(code)
+        if room is None or not room.multi or room.legacy:
+            return
+        for i, m in enumerate(room.members):
+            if m is not None and hmac.compare_digest(token, m.token):
+                self.send(addr, f"GONEOK {room.code}")
+                if i == 0:
+                    for o in room.members[1:]:
+                        if o is not None:
+                            self.send(o.addr, f"LEFT {room.code} 0")
+                    self.drop_room(room, "host gone (its app restarted)")
+                else:
+                    self.drop_member(room, i, "gone (its app restarted)")
+                return
+
+    def cmd_KICK(self, addr, args):
+        code, token, index = args[0].upper(), args[1], int(args[2])
+        room = self.rooms.get(code)
+        if room is None or not room.multi or room.legacy or not 1 <= index < MAX_MEMBERS:
+            return
+        host = room.members[0]
+        if host is None or not hmac.compare_digest(token, host.token):
+            self.send(addr, "ERR auth")
+            return
+        self.send(addr, f"KICKOK {room.code} {index}")
+        self.drop_member(room, index, "removed by the host")
 
     # ---------------------------------------------------------------- matchmaking
 
