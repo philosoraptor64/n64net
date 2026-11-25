@@ -180,6 +180,65 @@ def main():
     finally:
         srv.terminate()
         srv.wait(timeout=5)
+
+    # 9. ghost hosts (2026-11-24): a waiting host whose app is gone (HOST repeats stop) loses its room soon;
+    #    a host whose MOVE keepalives stop loses it after the member idle time, like any member
+    port3 = 7797
+    srv = subprocess.Popen([sys.executable, os.path.join(HERE, "rendezvous.py"), "--port", str(port3), "--bind",
+                            "127.0.0.1", "--password-file", pwfile.name, "--member-idle-secs", "2",
+                            "--waiting-idle-secs", "2"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.8)
+    try:
+        G = "game+1"
+        h = Client(port3)
+        h.cmd("HOSTN", [G, "EEEE", h.lan()])
+        h.recv_all()
+        time.sleep(1.0)
+        g = Client(port3)
+        g.cmd("JOINN", [G, "FFFF", g.lan()])   # (no such room: just shows the server answers)
+        g.recv_all()
+        alive = Client(port3)
+        alive.cmd("HOSTN", [G, "GGGG", alive.lan()])
+        end = time.time() + 4.5
+        while time.time() < end:
+            alive.cmd("HOSTN", [G, "GGGG", alive.lan()])   # this host keeps waiting
+            alive.recv_all(0.5)
+        late = Client(port3)
+        late.cmd("JOINN", [G, "EEEE", late.lan()])
+        got = texts(late.recv_all(0.6))
+        check("waiting host gone: its room closes", any(t.startswith("ERR nosuchroom") for t in got), str(got))
+        late2 = Client(port3)
+        late2.cmd("JOINN", [G, "GGGG", late2.lan()])
+        got = texts(late2.recv_all(0.6))
+        check("waiting host still repeating: its room stays", any(t.startswith("MEMBER GGGG") for t in got), str(got))
+
+        d = [Client(port3) for _ in range(2)]
+        d[0].cmd("HOSTN", [G, "HHHH", d[0].lan()])
+        d[0].recv_all()
+        toks = {}
+        d[1].cmd("JOINN", [G, "HHHH", d[1].lan()])
+        for t in texts(d[1].recv_all(0.6)):
+            p = t.split()
+            if p[0] == "MEMBER":
+                toks[1] = p[6]
+        for t in texts(d[0].recv_all(0.3)):
+            p = t.split()
+            if p[0] == "MEMBER":
+                toks[0] = p[6]
+        d[0].cmd("MOVE", ["HHHH", "host", toks.get(0, "x")], signed=False)   # the host: a keepalive client
+        d[0].recv_all(0.3)
+        end = time.time() + 6
+        while time.time() < end:
+            d[1].cmd("MOVE", ["HHHH", "guest", toks.get(1, "x")], signed=False)   # only the guest stays alive
+            d[1].recv_all(0.5)
+        late = Client(port3)
+        late.cmd("JOINN", [G, "HHHH", late.lan()])
+        got = texts(late.recv_all(0.6))
+        check("host's keepalives stopped: the room closes", any(t.startswith("ERR nosuchroom") for t in got), str(got))
+    finally:
+        srv.terminate()
+        srv.wait(timeout=5)
         os.unlink(pwfile.name)
     print("ALL PASS" if not failures else f"{len(failures)} FAILED")
     return 0 if not failures else 1

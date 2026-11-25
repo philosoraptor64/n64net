@@ -142,6 +142,8 @@ MEMBER_IDLE_SECS = 150      # rooms for up to 4: a member (not the host) whose M
 PRESENCE_SECS = 90          # forget a device this long after its last PRES/SEEK
 SEEK_SECS = 12              # a seeker that stopped repeating SEEK is dropped
 MATCH_HOLD_SECS = 60        # a paired code is held for its host; MATCH is repeated to both meanwhile
+WAITING_IDLE_SECS = 20     # a host that never had a member repeats HOST(N) ~1/s: 20 s of silence = its app is gone,
+                            # so its room closes (it was listed as open for ROOM_IDLE_SECS: ghost rooms, 2026-11-24)
 LIST_PER_PAGE = 12
 MAX_PEOPLE = 20000
 STATES = ("lobby", "seeking", "playing", "away")
@@ -223,6 +225,7 @@ class Room:
         self.legacy = False
         self.open_group = None   # matchmaking: listed as open to this group (OPEN), with the host's device
         self.open_device = None
+        self.ever_joined = False   # someone joined at some point (until then the host repeats HOST(N) ~1/s)
         self.members = [Member(host_addr, host_lan)] + [None] * (MAX_MEMBERS - 1) if multi else None
         if multi:
             self.members[0].token = self.host_token
@@ -482,6 +485,7 @@ class Rendezvous(asyncio.DatagramProtocol):
             room.members[idx].lan = lan
             room.members[idx].seen = time.monotonic()   # a repeated JOINN counts as a keepalive too
         room.touched = time.monotonic()
+        room.ever_joined = True
         self.by_addr[addr] = room
         self.send_members(room)
 
@@ -525,6 +529,7 @@ class Rendezvous(asyncio.DatagramProtocol):
         room.guest = addr
         room.guest_lan = lan
         room.touched = time.monotonic()
+        room.ever_joined = True
         self.by_addr[addr] = room
         self.send_peers(room)
 
@@ -822,7 +827,16 @@ class Rendezvous(asyncio.DatagramProtocol):
             if now - room.touched > limit:
                 self.drop_room(room, "idle")
                 continue
+            if not room.ever_joined and not room.relay and now - room.touched > WAITING_IDLE_SECS:
+                self.drop_room(room, "its host stopped waiting (no HOST for %d s)" % int(now - room.touched))
+                continue
             if room.multi and not room.legacy:
+                host = room.members[0]
+                if host is not None and host.keepalive and now - host.seen > MEMBER_IDLE_SECS:
+                    # the host's own MOVE keepalives stopped (its app was closed or crashed): the others have
+                    # lost it too (a guest losing the host ends its session), so the room goes
+                    self.drop_room(room, "the host's keepalives stopped %d s ago" % int(now - host.seen))
+                    continue
                 for i in range(1, MAX_MEMBERS):
                     m = room.members[i]
                     if m is not None and m.keepalive and now - m.seen > MEMBER_IDLE_SECS:
@@ -917,9 +931,13 @@ async def main():
                     help="ask the home router (NAT-PMP) to forward the port while running")
     ap.add_argument("--member-idle-secs", type=int, default=MEMBER_IDLE_SECS,
                     help="drop a room member whose keepalives stopped this long ago (default %(default)s)")
+    ap.add_argument("--waiting-idle-secs", type=int, default=WAITING_IDLE_SECS,
+                    help="close a room nobody joined yet once its host's HOST repeats stopped this long ago "
+                         "(default %(default)s)")
     ap.add_argument("-v", "--verbose", action="store_true")
     opts = ap.parse_args()
     globals()["MEMBER_IDLE_SECS"] = max(1, opts.member_idle_secs)
+    globals()["WAITING_IDLE_SECS"] = max(1, opts.waiting_idle_secs)
     logging.basicConfig(level=logging.DEBUG if opts.verbose else logging.INFO,
                         format="%(asctime)s %(message)s")
     password = None
@@ -949,7 +967,7 @@ async def main():
             log.warning("--natpmp: no default gateway found")
     try:
         while True:
-            await asyncio.sleep(min(10, max(1, MEMBER_IDLE_SECS // 4)))
+            await asyncio.sleep(min(10, max(1, MEMBER_IDLE_SECS // 4), max(1, WAITING_IDLE_SECS // 4)))
             proto.expire()
     finally:
         if mapper is not None:
