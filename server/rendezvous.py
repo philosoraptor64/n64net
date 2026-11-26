@@ -37,6 +37,10 @@ Protocol: one ASCII datagram per message, starting with "N64R1 ".
                                          (rooms for up to 4) one other member; index 0 = host
     LEFT <code> <index>                  (rooms for up to 4) that member left (BYE, GONE, KICK, or its
                                          MOVE keepalives stopped for MEMBER_IDLE_SECS)
+    HOSTMOVE <code> <index>              (rooms for up to 4) the host left (BYE, GONE, its keepalives stopped)
+                                         while others were in the room: member <index> (the lowest left, the
+                                         one who joined first) is the host now, as member 0, with its own token as
+                                         the host token. A room the host leaves empty closes.
 
 Ghosts (rooms for up to 4; authorised by move tokens, like MOVE, so no password needed):
   client -> server
@@ -331,6 +335,29 @@ class Rendezvous(asyncio.DatagramProtocol):
             for j, o in ms:
                 if j != i:
                     self.send(m.addr, f"MEMBER {room.code} {j} {self.visible_addr(o.addr, m.addr)} {o.lan} {i} {m.token}")
+
+    def host_left(self, room, why):
+        """The host of a room for up to 4 is gone: the member who joined first takes over (as member 0), or the room
+        closes if nobody else is in it (owner, 2026-11-24)."""
+        if not room.multi or room.legacy:
+            self.drop_room(room, why)
+            return
+        rest = [i for i in range(1, MAX_MEMBERS) if room.members[i] is not None]
+        if not rest:
+            self.drop_room(room, why)
+            return
+        old, k = room.members[0], rest[0]
+        m = room.members[k]
+        if old is not None and self.by_addr.get(old.addr) is room and old.addr != m.addr:
+            del self.by_addr[old.addr]
+        room.members[0], room.members[k] = m, None
+        room.host, room.host_lan, room.host_token = m.addr, m.lan, m.token
+        room.open_group, room.open_device = None, None   # the new host lists it again if it wants
+        room.touched = time.monotonic()
+        log.info("room %s: the host left (%s); member %d is the host now", room.code, why, k)
+        for o in room.members:
+            if o is not None:
+                self.send(o.addr, f"HOSTMOVE {room.code} {k}")
 
     def drop_member(self, room, index, why):
         m = room.members[index]
@@ -663,6 +690,9 @@ class Rendezvous(asyncio.DatagramProtocol):
                 if idx not in (None, 0):
                     self.drop_member(room, idx, "bye")
                     return
+                if idx == 0:
+                    self.host_left(room, "bye")
+                    return
             self.drop_room(room, "bye")
 
     def cmd_GONE(self, addr, args):
@@ -674,10 +704,7 @@ class Rendezvous(asyncio.DatagramProtocol):
             if m is not None and hmac.compare_digest(token, m.token):
                 self.send(addr, f"GONEOK {room.code}")
                 if i == 0:
-                    for o in room.members[1:]:
-                        if o is not None:
-                            self.send(o.addr, f"LEFT {room.code} 0")
-                    self.drop_room(room, "host gone (its app restarted)")
+                    self.host_left(room, "gone (its app restarted)")
                 else:
                     self.drop_member(room, i, "gone (its app restarted)")
                 return
@@ -968,10 +995,11 @@ class Rendezvous(asyncio.DatagramProtocol):
             if room.multi and not room.legacy:
                 host = room.members[0]
                 if host is not None and host.keepalive and now - host.seen > MEMBER_IDLE_SECS:
-                    # the host's own MOVE keepalives stopped (its app was closed or crashed): the others have
-                    # lost it too (a guest losing the host ends its session), so the room goes
-                    self.drop_room(room, "the host's keepalives stopped %d s ago" % int(now - host.seen))
-                    continue
+                    # the host's own MOVE keepalives stopped (its app was closed or crashed): the member who
+                    # joined first takes over, or the room goes if nobody else is in it
+                    self.host_left(room, "its keepalives stopped %d s ago" % int(now - host.seen))
+                    if room.code not in self.rooms:
+                        continue
                 for i in range(1, MAX_MEMBERS):
                     m = room.members[i]
                     if m is not None and m.keepalive and now - m.seen > MEMBER_IDLE_SECS:

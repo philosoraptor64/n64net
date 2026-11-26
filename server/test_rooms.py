@@ -139,11 +139,18 @@ def main():
         late.cmd("JOINN", [G, "CCCC", late.lan()])
         check("...which then takes no one else", "ERR full" in texts(late.recv_all()))
 
-        # 7. host leaves a room for up to 4: the room closes (host migration comes later)
+        # 7. host leaves a room for up to 4 with others in it: the one who joined first (member 1, now at the moved
+        #    address) is the host, as member 0; the room stays (owner, 2026-11-24)
         cs[0].cmd("BYE", ["BBBB"])
-        cs[1].recv_all()
+        got = texts(moved.recv_all(0.6))
+        check("host BYE: member 1 hears it is the host now (HOSTMOVE)", "HOSTMOVE BBBB 1" in got, str(got))
         cs[3].cmd("JOINN", [G, "BBBB", cs[3].lan()])
-        check("host BYE closes the room", "ERR nosuchroom" in texts(cs[3].recv_all()))
+        got = texts(cs[3].recv_all(0.6))
+        check("...the room stays: a newcomer joins and meets the new host as member 0",
+              any(t.startswith("MEMBER BBBB 0 ") for t in got), str(got))
+        moved.cmd("KICK", ["BBBB", tokens[1], "2"], signed=False)
+        check("...the new host's own token is the host token now (KICK)", any(t.startswith("KICKOK BBBB 2")
+              for t in texts(moved.recv_all(0.6))))
     finally:
         srv.terminate()
         srv.wait(timeout=5)
@@ -232,10 +239,19 @@ def main():
         while time.time() < end:
             d[1].cmd("MOVE", ["HHHH", "guest", toks.get(1, "x")], signed=False)   # only the guest stays alive
             d[1].recv_all(0.5)
+        got = texts(d[1].recv_all(0.3))
         late = Client(port3)
         late.cmd("JOINN", [G, "HHHH", late.lan()])
-        got = texts(late.recv_all(0.6))
-        check("host's keepalives stopped: the room closes", any(t.startswith("ERR nosuchroom") for t in got), str(got))
+        got2 = texts(late.recv_all(0.6))
+        check("host's keepalives stopped: the guest takes over (HOSTMOVE), the room stays",
+              any(t.startswith("MEMBER HHHH 0 ") for t in got2), str(got2))
+        late.cmd("BYE", ["HHHH"])
+        late.recv_all(0.3)
+        d[1].cmd("BYE", ["HHHH"])
+        d[1].recv_all(0.3)
+        late3 = Client(port3)
+        late3.cmd("JOINN", [G, "HHHH", late3.lan()])
+        check("the last one leaving closes the room", "ERR nosuchroom" in texts(late3.recv_all(0.6)))
     finally:
         srv.terminate()
         srv.wait(timeout=5)
