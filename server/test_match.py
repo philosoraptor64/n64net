@@ -154,8 +154,95 @@ def main_rooms():
         os.unlink(pwfile.name)
 
 
+def main_calls():
+    """CALL / ANSWER / UNCALL: invite one person; the room exists only after their yes."""
+    port = 7795
+    pwfile = tempfile.NamedTemporaryFile("w", delete=False)
+    pwfile.write(PW)
+    pwfile.close()
+    srv = subprocess.Popen([sys.executable, os.path.join(HERE, "rendezvous.py"), "--port", str(port), "--bind",
+                            "127.0.0.1", "--password-file", pwfile.name], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(0.8)
+        a, b, c = Client(port), Client(port), Client(port)
+        a.cmd("PRES", [V, "calleraa1", "Ann", "lobby", "-"])
+        b.cmd("PRES", [V, "calleebb2", "Ben", "lobby", "-"])
+        c.cmd("PRES", [V, "playercc3", "Cy", "playing", "mk64-us+1"])
+        a.recv_all(), b.recv_all(), c.recv_all()
+        a.cmd("LIST", [V, "calleraa1", "0"])
+        people = first(a.recv_all(), "PEOPLE")
+        check("PEOPLE entries carry the device (for CALL)", people is not None and "Ben,lobby,-,calleebb2"
+              in people[4:], str(people))
+
+        a.cmd("CALL", [V, "calleraa1", "Ann", "calleebb2", SESSION, "-"])
+        r = first(a.recv_all(), "CALLING")
+        check("CALL answers CALLING ringing", r is not None and r[2:] == ["Ben", "ringing"], str(r))
+        r = first(b.recv_all(), "CALLED")
+        check("the invited person gets CALLED with the caller's name", r is not None and r[2:] ==
+              ["calleraa1", "Ann", "-"], str(r))
+
+        b.cmd("ANSWER", [V, "calleebb2", "Ben", "calleraa1", "no"])
+        check("a no closes the question (CALLDONE)", first(b.recv_all(), "CALLDONE") is not None)
+        r = first(a.recv_all(), "CALLING")
+        check("the caller hears declined", r is not None and r[3] == "declined", str(r))
+        a.cmd("CALL", [V, "calleraa1", "Ann", "calleebb2", SESSION, "-"])
+        r = first(a.recv_all(), "CALLING")
+        check("repeating a declined CALL keeps saying declined", r is not None and r[3] == "declined", str(r))
+        check("... and doesn't ring again", first(b.recv_all(), "CALLED") is None)
+        a.cmd("UNCALL", [V, "calleraa1"])
+        a.recv_all()
+
+        a.cmd("CALL", [V, "calleraa1", "Ann", "calleebb2", SESSION, "-"])
+        a.recv_all(), b.recv_all()
+        b.cmd("ANSWER", [V, "calleebb2", "Ben", "calleraa1", "yes"])
+        rb = first(b.recv_all(), "MATCH")
+        ra = first(a.recv_all(), "MATCH")
+        check("a yes pairs them: the invited person joins", rb is not None and rb[3] == "guest", str(rb))
+        check("... the caller hosts the same code", ra is not None and ra[3] == "host" and rb is not None and
+              ra[2] == rb[2], str(ra))
+        a.cmd("CALL", [V, "calleraa1", "Ann", "calleebb2", SESSION, "-"])
+        r = first(a.recv_all(), "MATCH")
+        check("a repeated CALL after the yes repeats MATCH", r is not None and ra is not None and r[2] == ra[2], str(r))
+        b.cmd("ANSWER", [V, "calleebb2", "Ben", "calleraa1", "yes"])
+        r = first(b.recv_all(), "MATCH")
+        check("a repeated yes repeats MATCH", r is not None and rb is not None and r[2] == rb[2], str(r))
+        a.cmd("HOSTN", [SESSION, ra[2] if ra else "-", a.lan()])
+        r = first(a.recv_all(), "ROOM")
+        check("the caller opens the held code", r is not None and ra is not None and r[1] == ra[2], str(r))
+
+        # someone playing is busy; an unknown device is offline
+        d = Client(port)
+        d.cmd("CALL", [V, "dialerdd4", "Di", "playercc3", SESSION, "-"])
+        r = first(d.recv_all(), "CALLING")
+        check("calling someone in a game: busy", r is not None and r[3] == "busy", str(r))
+        d.cmd("CALL", [V, "dialerdd4", "Di", "nobody999", SESSION, "-"])
+        r = first(d.recv_all(), "CALLING")
+        check("calling someone not online: offline", r is not None and r[3] == "offline", str(r))
+
+        # UNCALL while ringing closes the question on the other side
+        e = Client(port)
+        e.cmd("PRES", [V, "calleeee5", "Eve", "lobby", "-"])
+        e.recv_all()
+        d.cmd("CALL", [V, "dialerdd4", "Di", "calleeee5", SESSION, "-"])
+        d.recv_all()
+        check("Eve is rung", first(e.recv_all(), "CALLED") is not None)
+        d.cmd("UNCALL", [V, "dialerdd4"])
+        d.recv_all()
+        check("UNCALL sends CALLDONE to the one rung", first(e.recv_all(), "CALLDONE") is not None)
+        e.cmd("ANSWER", [V, "calleeee5", "Eve", "dialerdd4", "yes"])
+        msgs = e.recv_all()
+        check("a late yes gets CALLDONE, no MATCH", first(msgs, "CALLDONE") is not None and
+              first(msgs, "MATCH") is None, str(texts(msgs)))
+    finally:
+        srv.terminate()
+        srv.wait()
+        os.unlink(pwfile.name)
+
+
 if __name__ == "__main__":
     main()
     main_rooms()
+    main_calls()
     print("ALL PASS" if not failures else f"{len(failures)} FAILED")
     sys.exit(1 if failures else 0)

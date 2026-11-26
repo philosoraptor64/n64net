@@ -72,6 +72,13 @@ Matchmaking ("look for a match"; every message starts with the version word M1, 
     UNSEEK M1 <device>                   stop looking
     LIST M1 <device> <page>              who is online and which rooms are open, page 0..
     OPEN M1 <device> <code> <0|1>        the host lists its room (HOSTN) as open to join, or not
+    CALL M1 <device> <name> <target_device> <session> <game|->
+                                         invite one person from the list to play (repeat ~every 2 s while
+                                         waiting; dropped after 12 s of silence = cancelled). No room exists yet:
+                                         it is made only when they say yes (then both get MATCH, the caller hosts)
+    ANSWER M1 <device> <name> <caller_device> <yes|no>
+                                         the invited person's answer (repeat a yes until MATCH)
+    UNCALL M1 <device>                   stop inviting
   server -> client
     PRESOK M1 <online>                   people online in the caller's group
     SEEKING M1 <secs_waited> <others_seeking>
@@ -80,9 +87,16 @@ Matchmaking ("look for a match"; every message starts with the version word M1, 
                                          the guest joins it with JOINN; relay 1 = connect through the server only
                                          (always 0 between friends; for strangers later). Sent again if either side
                                          repeats SEEK in the next 60 s.
-    PEOPLE M1 <page> <pages> <name,state,info>...
+    PEOPLE M1 <page> <pages> <name,state,info,device>...   (device: for CALL; older clients read 3 fields)
     ROOMS M1 <page> <pages> <code,host_name,info,members,max>...
     OPENOK M1 <code> <0|1>
+    CALLED M1 <caller_device> <caller_name> <game|->
+                                         to the invited person (their last presence address), repeated while
+                                         ringing: "X is inviting you"
+    CALLING M1 <target_name> <ringing|declined|noanswer|offline|busy>
+                                         to the caller (answer to CALL): how the invitation stands
+    CALLDONE M1 <caller_device>          to the invited person: the invitation is over (cancelled, expired,
+                                         answered elsewhere); close the question
   Groups: who may see and meet whom. A caller signed with the server password is in "friends"; on a server
   without a password everyone is in "open". Invite passes don't reach matchmaking. (Later: a "public" group,
   where every MATCH says relay 1.)
@@ -130,7 +144,7 @@ RELAY_IDLE_SECS = 120       # forget a relaying room with no traffic this long
 MAX_ROOMS = 5000
 MAX_PACKET = 1500
 AUTH_FIELDS = {"HOST": 3, "JOIN": 3, "RELAY": 1, "BYE": 1, "INVITE": 2, "HOSTN": 3, "JOINN": 3,  # before <time> <mac>
-               "PRES": 5, "SEEK": 6, "UNSEEK": 2, "LIST": 3, "OPEN": 4}
+               "PRES": 5, "SEEK": 6, "UNSEEK": 2, "LIST": 3, "OPEN": 4, "CALL": 6, "ANSWER": 5, "UNCALL": 2}
 PASS_COMMANDS = {"JOIN": 1, "RELAY": 0, "BYE": 0, "JOINN": 1}  # may use an invite pass; index of <code>
 INVITE_MAX_TTL = 7 * 24 * 3600
 AUTH_WINDOW_SECS = 300      # allowed clock difference
@@ -144,6 +158,7 @@ SEEK_SECS = 12              # a seeker that stopped repeating SEEK is dropped
 MATCH_HOLD_SECS = 60        # a paired code is held for its host; MATCH is repeated to both meanwhile
 WAITING_IDLE_SECS = 20     # a host that never had a member repeats HOST(N) ~1/s: 20 s of silence = its app is gone,
                             # so its room closes (it was listed as open for ROOM_IDLE_SECS: ghost rooms, 2026-11-24)
+CALL_RING_SECS = 45         # an invitation nobody answered ends ("noanswer")
 LIST_PER_PAGE = 12
 MAX_PEOPLE = 20000
 STATES = ("lobby", "seeking", "playing", "away")
@@ -204,6 +219,20 @@ class Seeker:
         self.session = ""
         self.games = []
         self.lan = "-"
+
+
+class Call:
+    """An invitation (CALL): the caller waits for the target's yes or no; no room until yes."""
+    def __init__(self, caller, target, since):
+        self.caller = caller          # device ids
+        self.target = target
+        self.since = since
+        self.last = since
+        self.addr = None              # the caller's address
+        self.name = "-"
+        self.session = ""
+        self.game = "-"
+        self.state = "ringing"        # ringing | declined | noanswer
 
 
 class Room:
@@ -273,6 +302,7 @@ class Rendezvous(asyncio.DatagramProtocol):
         self.seekers = {}     # device -> Seeker
         self.matched = {}     # device -> (MATCH text, expiry)
         self.reserved = {}    # code -> (host ip, expiry): held for a matched host
+        self.calls = {}       # caller device -> Call (invitations)
 
     def connection_made(self, transport):
         self.transport = transport
@@ -794,6 +824,111 @@ class Rendezvous(asyncio.DatagramProtocol):
             room.open_group, room.open_device = None, None
         self.send(addr, f"OPENOK {MATCH_VERSION} {code} {1 if room.open_group else 0}")
 
+    def pair(self, host, guest, game):
+        """Both get MATCH (held MATCH_HOLD_SECS, repeated on SEEK/CALL/ANSWER); host/guest: (device, addr, name, group)."""
+        now = time.monotonic()
+        code = self.new_code()
+        if code is None:
+            return None
+        relay = 1 if host[3] == "public" else 0
+        expiry = now + MATCH_HOLD_SECS
+        self.reserved[code] = (host[1][0], expiry)
+        for a, b, role in ((host, guest, "host"), (guest, host, "guest")):
+            text = f"MATCH {MATCH_VERSION} {code} {role} {game} {b[0]} {b[2]} {relay}"
+            self.matched[a[0]] = (text, expiry)
+            self.seekers.pop(a[0], None)
+            if a[0] in self.people:
+                self.people[a[0]].state = "playing"
+            self.send(a[1], text)
+        return code
+
+    def cmd_CALL(self, addr, args):
+        if not self.check_version(addr, args):
+            return
+        device, name, target, session, game = args[1], args[2], args[3], args[4], args[5]
+        if not self.valid_device(device) or not self.valid_device(target) or device == target or \
+                not self.valid_word(name, 96) or not self.valid_word(session, 64) or not self.valid_word(game, 80):
+            self.send(addr, "ERR bad")
+            return
+        now = time.monotonic()
+        m = self.matched.get(device)
+        if m is not None and m[1] > now:
+            self.send(addr, m[0])       # they said yes: say it again
+            return
+        me = self.touch_person(addr, device, name, "lobby", "-")
+        if me is None:
+            self.send(addr, "ERR busy")
+            return
+        t = self.people.get(target)
+        tname = t.name if t is not None else "-"
+        c = self.calls.get(device)
+        if c is not None and c.target != target:
+            self.end_call(c)
+            c = None
+        if c is None:
+            if t is None or t.group != me.group or now - t.seen > PRESENCE_SECS:
+                self.send(addr, f"CALLING {MATCH_VERSION} {tname} offline")
+                return
+            if t.state != "lobby" or any(o.target == target and o.state == "ringing" for o in self.calls.values()):
+                self.send(addr, f"CALLING {MATCH_VERSION} {tname} busy")
+                return
+            c = self.calls[device] = Call(device, target, now)
+            log.info("matchmaking: %s invites %s", device, target)
+        c.addr, c.name, c.session, c.game, c.last = addr, name, session, game, now
+        if c.state == "ringing" and now - c.since > CALL_RING_SECS:
+            c.state = "noanswer"
+            if t is not None and t.addr is not None:
+                self.send(t.addr, f"CALLDONE {MATCH_VERSION} {device}")
+        if c.state == "ringing" and t is not None and t.addr is not None:
+            self.send(t.addr, f"CALLED {MATCH_VERSION} {device} {name} {game}")
+        self.send(addr, f"CALLING {MATCH_VERSION} {tname} {c.state}")
+
+    def cmd_ANSWER(self, addr, args):
+        if not self.check_version(addr, args):
+            return
+        device, name, caller, answer = args[1], args[2], args[3], args[4]
+        if not self.valid_device(device) or not self.valid_device(caller) or answer not in ("yes", "no") or \
+                not self.valid_word(name, 96):
+            self.send(addr, "ERR bad")
+            return
+        now = time.monotonic()
+        m = self.matched.get(device)
+        if m is not None and m[1] > now:
+            self.send(addr, m[0])       # a repeated yes
+            return
+        me = self.touch_person(addr, device, name, "lobby", "-")
+        c = self.calls.get(caller)
+        if me is None or c is None or c.target != device or c.state != "ringing" or \
+                now - c.last > SEEK_SECS or (self.people.get(caller) and self.people[caller].group != me.group):
+            self.send(addr, f"CALLDONE {MATCH_VERSION} {caller}")   # cancelled or over meanwhile
+            return
+        if answer == "no":
+            c.state = "declined"
+            log.info("matchmaking: %s declined %s", device, caller)
+            self.send(addr, f"CALLDONE {MATCH_VERSION} {caller}")
+            self.send(c.addr, f"CALLING {MATCH_VERSION} {name} declined")
+            return
+        del self.calls[caller]
+        code = self.pair((caller, c.addr, c.name, me.group), (device, addr, name, me.group), c.game)
+        if code is None:
+            self.send(addr, "ERR busy")
+            return
+        log.info("matchmaking: %s accepted %s -> room %s", device, caller, code)
+
+    def cmd_UNCALL(self, addr, args):
+        if not self.check_version(addr, args):
+            return
+        c = self.calls.get(args[1])
+        if c is not None and c.addr == addr:
+            self.end_call(c)
+        self.send(addr, f"CALLING {MATCH_VERSION} - over")
+
+    def end_call(self, c):
+        self.calls.pop(c.caller, None)
+        t = self.people.get(c.target)
+        if t is not None and t.addr is not None and c.state == "ringing":
+            self.send(t.addr, f"CALLDONE {MATCH_VERSION} {c.caller}")
+
     def cmd_LIST(self, addr, args):
         if not self.check_version(addr, args):
             return
@@ -816,7 +951,7 @@ class Rendezvous(asyncio.DatagramProtocol):
 
         sl = slice(page * LIST_PER_PAGE, (page + 1) * LIST_PER_PAGE)
         self.send(addr, " ".join([f"PEOPLE {MATCH_VERSION} {page} {pages(len(people))}"] +
-                                 [f"{p.name},{p.state},{p.info}" for p in people[sl]]))
+                                 [f"{p.name},{p.state},{p.info},{p.device}" for p in people[sl]]))
         self.send(addr, " ".join([f"ROOMS {MATCH_VERSION} {page} {pages(len(rooms))}"] +
                                  [f"{c},{n},{i},{m},{MAX_MEMBERS}" for c, n, i, m in rooms[sl]]))
 
@@ -853,6 +988,9 @@ class Rendezvous(asyncio.DatagramProtocol):
         for c, h in list(self.reserved.items()):
             if h[1] <= now:
                 del self.reserved[c]
+        for c in list(self.calls.values()):
+            if now - c.last > SEEK_SECS:      # the caller stopped repeating CALL: cancelled (or its app is gone)
+                self.end_call(c)
 
 
 NATPMP_PORT = 5351

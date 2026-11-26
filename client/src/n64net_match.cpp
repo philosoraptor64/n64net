@@ -142,6 +142,25 @@ extern "C" int n64net_match_open(int sock, const N64NetMatchConfig *c, const cha
                                    Word(room_code, 4) + " " + (open ? "1" : "0"));
 }
 
+extern "C" int n64net_match_call(int sock, const N64NetMatchConfig *c, const char *target_device,
+                                 const char *session, const char *game) {
+    if (c == nullptr || target_device == nullptr || target_device[0] == '\0') return -1;
+    return SendSigned(sock, c, std::string("CALL ") + kVersion + " " + Word(c->device, 32) + " " +
+                                   Encode(c->name, 96) + " " + Word(target_device, 32) + " " + Word(session, 64) +
+                                   " " + Word(game, 80));
+}
+
+extern "C" int n64net_match_answer(int sock, const N64NetMatchConfig *c, const char *caller_device, int yes) {
+    if (c == nullptr || caller_device == nullptr || caller_device[0] == '\0') return -1;
+    return SendSigned(sock, c, std::string("ANSWER ") + kVersion + " " + Word(c->device, 32) + " " +
+                                   Encode(c->name, 96) + " " + Word(caller_device, 32) + " " + (yes ? "yes" : "no"));
+}
+
+extern "C" int n64net_match_uncall(int sock, const N64NetMatchConfig *c) {
+    if (c == nullptr) return -1;
+    return SendSigned(sock, c, std::string("UNCALL ") + kVersion + " " + Word(c->device, 32));
+}
+
 extern "C" int n64net_match_parse(const void *data, int size, N64NetMatchEvent *out) {
     if (data == nullptr || out == nullptr || size <= (int)kPrefixLen || size > 2000 ||
         std::memcmp(data, kPrefix, kPrefixLen) != 0) {
@@ -186,6 +205,7 @@ extern "C" int n64net_match_parse(const void *data, int size, N64NetMatchEvent *
                 Decode(e[0], p.name, sizeof(p.name));
                 std::snprintf(p.state, sizeof(p.state), "%s", e[1].c_str());
                 std::snprintf(p.info, sizeof(p.info), "%s", e[2].c_str());
+                if (e.size() >= 4) std::snprintf(p.device, sizeof(p.device), "%s", e[3].c_str());
             } else if (!people && e.size() >= 5) {
                 N64NetMatchRoom &r = out->rooms[out->count++];
                 std::snprintf(r.code, sizeof(r.code), "%s", e[0].c_str());
@@ -195,6 +215,18 @@ extern "C" int n64net_match_parse(const void *data, int size, N64NetMatchEvent *
                 r.max_members = atoi(e[4].c_str());
             }
         }
+    } else if (w == "CALLED" && f.size() >= 5) {
+        out->kind = N64NET_MATCH_CALLED;
+        std::snprintf(out->peer_device, sizeof(out->peer_device), "%s", f[2].c_str());
+        Decode(f[3], out->peer_name, sizeof(out->peer_name));
+        std::snprintf(out->game, sizeof(out->game), "%s", f[4].c_str());
+    } else if (w == "CALLING" && f.size() >= 4) {
+        out->kind = N64NET_MATCH_CALLING;
+        Decode(f[2], out->peer_name, sizeof(out->peer_name));
+        std::snprintf(out->call_state, sizeof(out->call_state), "%s", f[3].c_str());
+    } else if (w == "CALLDONE" && f.size() >= 3) {
+        out->kind = N64NET_MATCH_CALLDONE;
+        std::snprintf(out->peer_device, sizeof(out->peer_device), "%s", f[2].c_str());
     } else if (w == "OPENOK" && f.size() >= 4) {
         out->kind = N64NET_MATCH_OPENOK;
         std::snprintf(out->code, sizeof(out->code), "%s", f[2].c_str());

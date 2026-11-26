@@ -41,6 +41,15 @@ int n64net_match_list(int sock, const N64NetMatchConfig *config, int page);
  * still waits): the server only accepts it from the room host's address (else "ERR nosuchroom"), and the OPENOK
  * comes back on that socket. Repeat until OPENOK: right after hosting, the room may not be on the server yet. */
 int n64net_match_open(int sock, const N64NetMatchConfig *config, const char *room_code, int open);
+/* Invitations: invite one person from the list (their `device` from PEOPLE). Repeat n64net_match_call() ~every 2 s
+ * while waiting (CALLING tells how it stands); stop repeating or n64net_match_uncall() to cancel. The invited
+ * person's app gets CALLED (on the socket it sends presence from) and answers with n64net_match_answer(); a yes is
+ * repeated until MATCH. Nothing is made on the server until the yes: then both get MATCH (the caller hosts), as
+ * with "look for a match". game: what the caller has in mind ("<game>+<build>") or NULL/"-". */
+int n64net_match_call(int sock, const N64NetMatchConfig *config, const char *target_device, const char *session,
+                      const char *game);
+int n64net_match_answer(int sock, const N64NetMatchConfig *config, const char *caller_device, int yes);
+int n64net_match_uncall(int sock, const N64NetMatchConfig *config);
 
 enum {
     N64NET_MATCH_NONE = 0,   /* not a matchmaking answer */
@@ -50,7 +59,11 @@ enum {
     N64NET_MATCH_PEOPLE,     /* page, pages, count, people[] */
     N64NET_MATCH_ROOMS,      /* page, pages, count, rooms[] */
     N64NET_MATCH_OPENOK,     /* code, open */
-    N64NET_MATCH_ERROR       /* error: "auth", "matchversion", "bad", "busy", "nosuchroom", ... */
+    N64NET_MATCH_ERROR,      /* error: "auth", "matchversion", "bad", "busy", "nosuchroom", ... */
+    N64NET_MATCH_CALLED,     /* someone invites this device: peer_device, peer_name, game ("-" = any) */
+    N64NET_MATCH_CALLING,    /* the caller's invitation: peer_name, call_state ringing | declined | noanswer |
+                                offline | busy | over */
+    N64NET_MATCH_CALLDONE    /* the invitation from peer_device is over (cancelled, expired, answered) */
 };
 
 #define N64NET_MATCH_LIST_MAX 12
@@ -59,6 +72,7 @@ typedef struct N64NetMatchPerson {
     char name[100];     /* UTF-8 */
     char state[12];
     char info[68];
+    char device[36];    /* for n64net_match_call ("" from an older server) */
 } N64NetMatchPerson;
 
 typedef struct N64NetMatchRoom {
@@ -83,6 +97,7 @@ typedef struct N64NetMatchEvent {
     N64NetMatchRoom rooms[N64NET_MATCH_LIST_MAX];
     int open;
     char error[32];
+    char call_state[16];
 } N64NetMatchEvent;
 
 /* Returns the kind (N64NET_MATCH_NONE if `data` isn't a matchmaking answer from the server). */
