@@ -20,7 +20,8 @@
  * sends the pieces that differ. The guest then decides word by word, with its own word G beside the host's:
  *  - the same meaning (same encoding): G stays;
  *  - host "region r + off": G stays if it equals the host's original value (data that only looked like a
- *    pointer there); otherwise the guest's own address for r + off;
+ *    pointer there); otherwise the guest's own address for r + off, unless G is plain data (then the host's value
+ *    is most likely data too; translate_always = 1 says otherwise);
  *  - host foreign H: G stays if equal; else the guest's address for the same thing if it is known (from other
  *    places where the host has H and the guest a foreign word of its own: an asset pointer appears in pieces
  *    that are in step too); else G if it is foreign itself (a pointer of this device); else H (data);
@@ -78,6 +79,8 @@ typedef struct {
     /* 1: this game's state holds no pointers outside its regions (GoldenEye: everything is in i64's fixed arena),
      * so words that look like pointers elsewhere are data and always take the host's value */
     int no_foreign;
+    /* 1: a word the host has in a region is always translated, even where this device has plain data there */
+    int translate_always;
     uint8_t uuid[16];
     /* mapped memory of this process (sorted), refreshed by n64net_reloc_scan */
     n64net_reloc_range *vm;
@@ -403,12 +406,16 @@ static inline int n64net_reloc_load(const n64net_reloc *r, const n64net_reloc_sp
                         st->same++;
                         continue;
                     }
-                    /* a pointer: this device's address for it. (Where this device has plain data instead, the
-                     * memory differs here altogether, and the host's word is far more likely a real pointer than a
-                     * number that happens to look like one: a wrong pointer would crash, a wrong number would not.) */
-                    w = r->region[kind].lo + off;
-                    if (g == 0 || tmp.region_ptrs || tmp.foreign) st->translated++;
-                    else st->guessed++;
+                    if (g == 0 || tmp.region_ptrs || tmp.foreign || r->translate_always) {
+                        w = r->region[kind].lo + off;   /* a pointer field here too: this device's address */
+                        st->translated++;
+                    } else {
+                        /* plain data here: the host's word is most likely data too (GoldenEye's RAM: 13 real
+                         * pointers into the game library, against ~90 floats next to a small int that read as one
+                         * in diverged memory) */
+                        w = h.region_lo[kind] + off;
+                        st->guessed++;
+                    }
                 } else if (top == N64NET_RELOC_TAG_FOREIGN) {
                     const uint64_t hv = e & ((1ull << 48) - 1);
                     n64net_reloc_pair_ *q = pairs ? n64net_reloc_find_(pairs, mask, hv) : NULL;
