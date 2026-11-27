@@ -33,12 +33,14 @@ std::deque<Packet> gWire;
 int gLossPercent = 0, gLatencyUsecs = 0, gJitterUsecs = 0;
 uint32_t gLateStart = 0;      // peer 1 starts this many frames late
 uint32_t gCorruptTick = 0;
-uint32_t gAutoMax = 0;        // auto delay [1, gAutoMax] when non-zero    // peer 1's state is nudged at this tick (desync test)
+uint32_t gAutoMax = 0;
+bool gResync = false;         // resync after the desync (peer 0 is the host)
 
-struct Game {  // the "simulation": two points moved by the pads, plus an RNG
+struct Game {  // the "simulation": two points moved by the pads, plus an RNG (and memory it scribbles on)
     int32_t x[2], y[2];
     uint32_t rng;
     uint32_t tick;
+    uint8_t blob[24000];
     void Step(const n64net_pad pads[2]) {
         for (int p = 0; p < 2; p++) {
             x[p] += pads[p].stick_x + 3 * pads[p].rstick_x;
@@ -46,6 +48,7 @@ struct Game {  // the "simulation": two points moved by the pads, plus an RNG
             if (pads[p].buttons & 1) { rng = rng * 69069u + 1u; x[p] ^= (int32_t)(rng >> 20); }
             if (pads[p].buttons_hi & 1) y[p] ^= 0x5a5a;
         }
+        blob[(rng + tick * 7u) % sizeof(blob)] ^= (uint8_t)(x[0] ^ y[1]);
         tick++;
     }
     uint32_t Hash() const {
@@ -95,11 +98,15 @@ void Save(void *u, uint32_t slot) {
     p->slots[slot] = p->game;
 }
 void Load(void *u, uint32_t slot) { Peer *p = (Peer *)u; p->game = p->slots[slot]; }
+void SaveAll(void *u, uint8_t *out) { memcpy(out, &((Peer *)u)->game, sizeof(Game)); }
+void LoadAll(void *u, const uint8_t *in) { memcpy(&((Peer *)u)->game, in, sizeof(Game)); }
 void Advance(void *u) {
     Peer *p = (Peer *)u;
     n64net_pad pads[2];
     for (int i = 0; i < 2; i++) n64net_input_get(p->net, i, p->game.tick, &pads[i]);
     p->game.Step(pads);
+    // resync tests: peer 1's simulation goes wrong at that tick (also when replayed: like a real desync)
+    if (gResync && p->id == 1 && p->game.tick == gCorruptTick) p->game.x[0]++;
     p->hashes[p->game.tick % 256] = p->game.Hash();
 }
 
@@ -156,7 +163,9 @@ int Run(const char *name, uint32_t window, uint32_t delay, int loss, int latency
         c.now_usecs = Now;
         p.net = n64net_input_create(&c);
         if (gAutoMax) n64net_input_set_auto_delay(p.net, 1, gAutoMax);
+        if (gResync) n64net_resync_enable(p.net, i == 0, sizeof(Game), SaveAll, LoadAll, &p);
     }
+    uint32_t held[2] = {0, 0};
     uint32_t stalls[2] = {0, 0};
     for (uint32_t f = 0; f < frames; f++) {
         gNow += 16667;
@@ -175,6 +184,10 @@ int Run(const char *name, uint32_t window, uint32_t delay, int loss, int latency
                     return 1;
                 }
             }
+            if (gResync && n64net_resync_hold(p.net, tick)) {
+                held[i]++;
+                continue;
+            }
             // Sample once per tick (a waiting frame doesn't sample again).
             if (p.frames_waited == 0) n64net_input_set_local(p.net, tick, PadFor(p, tick));
             if (!n64net_input_ready(p.net, tick)) {
@@ -185,7 +198,7 @@ int Run(const char *name, uint32_t window, uint32_t delay, int loss, int latency
             }
             p.frames_waited = 0;
             Advance(&p);
-            if (i == 1 && gCorruptTick && p.game.tick == gCorruptTick) {
+            if (i == 1 && gCorruptTick && !gResync && p.game.tick == gCorruptTick) {
                 p.game.x[0]++;
                 p.hashes[p.game.tick % 256] = p.game.Hash();
             }
@@ -209,6 +222,21 @@ int Run(const char *name, uint32_t window, uint32_t delay, int loss, int latency
     uint32_t dtick;
     uint8_t dkind;
     n64net_input_stats st[2];
+    if (gResync) {
+        uint32_t done[2], hold;
+        const int st0 = n64net_resync_status(gPeers[0].net, &hold, &done[0]);
+        const int st1 = n64net_resync_status(gPeers[1].net, &hold, &done[1]);
+        // in step again: no desync since, and sync checks after the hold matched (both ends count them)
+        const bool same = n64net_sync_matched(gPeers[0].net) + n64net_sync_matched(gPeers[1].net) > 2 * (gPeers[0].game.tick / 10) * 6 / 10;
+        const int d = n64net_sync_desynced(gPeers[0].net, &dtick, &dkind) + n64net_sync_desynced(gPeers[1].net, &dtick, &dkind);
+        const uint32_t matched = n64net_sync_matched(gPeers[0].net) + n64net_sync_matched(gPeers[1].net);
+        rc = (st0 == 0 && st1 == 0 && done[0] == 1 && done[1] == 1 && same && d == 0) ? 0 : 1;
+        printf("%s: %s (status %d/%d, resyncs %u/%u, held frames %u/%u, ticks %u/%u, in step after %d, desynced %d, "
+               "sync matched %u)\n", name, rc ? "FAIL" : "ok", st0, st1, done[0], done[1], held[0], held[1],
+               gPeers[0].game.tick, gPeers[1].game.tick, same, d, matched);
+        for (int i = 0; i < 2; i++) n64net_input_destroy(gPeers[i].net);
+        return rc;
+    }
     if (gCorruptTick) {
         // Expected: a desync reported on both sides.
         const int seen = n64net_sync_desynced(gPeers[0].net, &dtick, &dkind) + n64net_sync_desynced(gPeers[1].net, &dtick, &dkind);
@@ -263,6 +291,11 @@ int main() {
     gLateStart = 0;
     gCorruptTick = 500;
     rc |= Run("desync detection", 8, 2, 0, 20, 5, 1500, false);
+    gResync = true;
+    rc |= Run("resync (rollback)", 8, 2, 0, 20, 5, 3000, false);
+    rc |= Run("resync (rollback, 50ms+30 jitter, 10% loss)", 8, 2, 10, 50, 30, 3000, false);
+    rc |= Run("resync (lockstep, 5% loss)", 0, 2, 5, 30, 10, 3000, false);
+    gResync = false;
     gCorruptTick = 0;
     printf(rc ? "SOME TESTS FAILED\n" : "ALL PASSED\n");
     return rc;

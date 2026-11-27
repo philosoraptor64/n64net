@@ -265,6 +265,31 @@ void n64net_sync_record(n64net_input *net, uint32_t tick, uint8_t kind, uint32_t
 int n64net_sync_desynced(n64net_input *net, uint32_t *tick, uint8_t *kind);
 uint32_t n64net_sync_matched(n64net_input *net); /* checks that matched so far */
 
+/* --- Resync (getting back in step after a desync) ----------------------------
+ * Instead of ending the match at a desync, the machines take the host's game state:
+ *  - The host (the machine that decides; is_host) sees a desync and picks a hold tick H past every machine's
+ *    present (its tick + window + delay + a margin), announced to every machine (repeated).
+ *  - Every machine plays up to H and holds there: n64net_resync_hold(net, H) returns 1 (don't run the tick:
+ *    re-present the last picture, keep receiving packets, call again next frame). Rollback games call it after
+ *    n64net_rollback_frame (a rollback that comes in while holding is replayed first).
+ *  - Once all inputs before H are confirmed (and no rollback is pending), each machine saves its state
+ *    (save(): the whole simulation, state_size bytes, as rollback saves it). The host sends a hash of every
+ *    960-byte piece; each other machine asks only for the pieces that differ from its own (a desync usually
+ *    touches a few), checks the whole state's hash and loads it (load()). After load() the game's own copy
+ *    of "the state before H" (its rollback slot) must be the loaded one (the rollback driver re-saves it at
+ *    the next n64net_rollback_frame(H)).
+ *  - The host goes on once every machine has loaded. The sync checks start again from H.
+ * n64net_sync_desynced stays 1 until the resync is done. If it fails (no progress for 20 s, more than 3 in a
+ * match, a machine already past H), n64net_resync_status says so: then end the match as before.
+ * Packets: input type 8, see n64net_input.cpp. Machines without it ignore them (and never hold). */
+void n64net_resync_enable(n64net_input *net, int is_host, uint32_t state_size,
+                          void (*save)(void *user, uint8_t *out), void (*load)(void *user, const uint8_t *in),
+                          void *user);
+int n64net_resync_hold(n64net_input *net, uint32_t tick);
+/* 0: none going, 1: one in progress (hold tick in *hold_tick), 2: the last one failed (end the match).
+ * *done: resyncs completed in this match. Either pointer may be NULL. */
+int n64net_resync_status(n64net_input *net, uint32_t *hold_tick, uint32_t *done);
+
 /* --- Away / back -----------------------------------------------------------
  * The app is going to the background (iOS) or coming back: tells the peer,
  * which should wait longer before giving up (n64net_input_peer_away). */

@@ -27,6 +27,12 @@
  *           u8 length, bytes) | checksum                                   (host -> joiner: the input log)
  *   have:   magic | version | type=6 | sender | 0 | session | u32 log ticks received | checksum (joiner -> host)
  *   rejoin: magic | version | type=7 | sender | 0 | session | u8 player mask | u32 live tick | checksum
+ *   resync: magic | version | type=8 | sender | what | session | u32 resync id | ... | checksum   (n64net_resync_*)
+ *           what 1 hold  (host -> all): u32 hold tick | u32 state size
+ *           what 2 offer (host -> all): u32 whole-state hash | u32 first piece | u8 n | n x u32 piece hash
+ *           what 3 need  (-> host): u8 kind (0 hashes, 1 pieces) | u8 n | n x (u32 first, u16 count)
+ *           what 4 piece (host -> all): u32 piece | up to 960 bytes
+ *           what 5 done  (-> host): u32 the sender's local mask
  * Inputs are sent oldest-unacknowledged first, up to 16 per packet, so a
  * lost packet is covered by the next one and a long gap still drains. */
 #include "n64net_input.h"
@@ -36,6 +42,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <vector>
 
@@ -44,7 +51,13 @@ namespace {
 constexpr uint8_t kVersion = 3;   // 3: several players per machine, events, per-peer echo
 constexpr uint32_t kRttRing = 90;  // round trips kept (auto delay uses their 90th percentile)
 constexpr uint8_t kTypeInput = 0, kTypeSync = 1, kTypeAway = 2, kTypeBack = 3, kTypeRetire = 4, kTypeLog = 5,
-                  kTypeHave = 6, kTypeRejoin = 7;
+                  kTypeHave = 6, kTypeRejoin = 7, kTypeResync = 8;
+// Resync: state pieces (one per packet), hashes per offer packet, ranges per need packet, packets per serve
+// call, the hold's margin past every machine's present, give-up times, resyncs per match.
+constexpr uint8_t kRsHold = 1, kRsOffer = 2, kRsNeed = 3, kRsPiece = 4, kRsDone = 5;
+constexpr uint32_t kRsPieceBytes = 960, kRsHashesPerOffer = 200, kRsRangesPerNeed = 140, kRsPacketsPerServe = 48;
+constexpr uint32_t kRsMargin = 30, kRsMaxPerMatch = 3, kRsDoneRepeats = 100;
+constexpr uint64_t kRsStallUsecs = 20000000, kRsNoHostUsecs = 8000000, kRsRepeatUsecs = 100000;
 // Joining a running match: the host streams the log to the joiner, up to this many packets per send; when the
 // joiner has all but kJoinNear ticks of it, the players go live kJoinMargin ticks after the host's newest tick.
 constexpr uint32_t kLogPacketsPerSend = 16, kJoinNear = 60, kJoinMargin = 45;
@@ -285,6 +298,49 @@ struct n64net_input {
     uint32_t desync_tick = 0;
     uint8_t desync_kind = 0;
     uint32_t sync_matched = 0;
+    uint32_t sync_from = 0;          // sync checks of earlier ticks are ignored (a resync replaced that state)
+    uint64_t desync_seen_at = 0;
+    void ResetSync(uint32_t from) {
+        desynced = false;
+        sync_from = from;
+        local_sync_count = 0;
+        for (uint32_t &c : remote_sync_count) c = 0;
+    }
+
+    // Resync (n64net_resync_*).
+    struct Resync {
+        bool enabled = false, host = false;
+        uint32_t size = 0, pieces = 0;
+        void (*save)(void *, uint8_t *) = nullptr;
+        void (*load)(void *, const uint8_t *) = nullptr;
+        void *user = nullptr;
+        bool active = false, failed = false;
+        uint32_t id = 0, hold = kNoTick, started = 0, done = 0;
+        uint64_t progress_at = 0, repeat_at = 0;
+        bool have_mine = false, compared = false, total_known = false;
+        uint32_t total = 0;
+        std::vector<uint8_t> buf;          // this machine's state at the hold; a guest patches the host's pieces in
+        std::vector<uint32_t> mine, theirs;
+        std::vector<uint8_t> hash_got, piece_ok;
+        uint32_t done_mask = 0;            // host: local masks of the machines that loaded
+        std::vector<uint8_t> queued[2];    // host: requested (0 hashes, 1 pieces) and not sent yet
+        std::deque<uint32_t> queue;        // host: kind << 31 | first piece
+        uint32_t done_repeats = 0, done_id = 0;
+        uint64_t done_at = 0;
+    } rs;
+    void ResyncMaybeStart();
+    void ResyncBegin(uint32_t id, uint32_t hold);
+    void ResyncFail(const char *why);
+    void ResyncServe();
+    void ResyncSaveMine();
+    void ResyncGuestStep();
+    void ResyncHandle(Reader &r, uint8_t player, uint8_t what);
+    void ResyncSend(uint8_t what, const uint8_t *body, uint32_t len);
+    uint32_t ResyncNeededMask() const {
+        uint32_t m = 0;
+        for (int p = 0; p < cfg.num_players; p++) if (IsRemote(p) && !retired[p]) m |= 1u << p;
+        return m;
+    }
 
     bool peer_away = false;
 
@@ -632,7 +688,7 @@ void n64net_input::SendSync() {
 }
 
 void n64net_input::CompareSync(const SyncEntry &a, const SyncEntry &b) {
-    if (a.tick != b.tick || a.kind != b.kind || a.tick == kNoTick) return;
+    if (a.tick != b.tick || a.kind != b.kind || a.tick == kNoTick || a.tick < sync_from) return;
     if (a.hash == b.hash) {
         sync_matched++;
         return;
@@ -641,8 +697,10 @@ void n64net_input::CompareSync(const SyncEntry &a, const SyncEntry &b) {
         desynced = true;
         desync_tick = a.tick;
         desync_kind = a.kind;
+        desync_seen_at = Now();
         Log("n64net input: DESYNC at tick %u (kind %u): 0x%08X here, 0x%08X on the peer\n", a.tick, a.kind, a.hash,
             b.hash);
+        ResyncMaybeStart();
     }
 }
 
@@ -1427,6 +1485,10 @@ int n64net_input_handle_packet(n64net_input *net, const uint8_t *data, uint32_t 
         net->ApplyRejoin(mask, tick);
         break;
     }
+    case kTypeResync:
+        net->last_recv_usecs = net->Now();
+        net->ResyncHandle(r, player, count);
+        break;
     case kTypeAway:
     case kTypeBack:
         net->stats.packets_received++;
@@ -1448,6 +1510,7 @@ void n64net_input_resend(n64net_input *net) {
     if (net->Now() - net->last_send_usecs >= 10000) {
         net->SendInputs();
     }
+    if (net->rs.enabled) net->ResyncServe();
 }
 
 int n64net_peek_rollback(n64net_input *net, uint32_t *tick) {
@@ -1793,4 +1856,309 @@ uint32_t n64net_input_log_ticks(n64net_input *net, uint32_t *live_tick) {
     if (!net) return 0;
     if (live_tick) *live_tick = net->cfg.joining ? net->live_from : net->last_rejoin_tick;
     return net->log_end - net->cfg.start_tick;
+}
+
+// ---- Resync ----------------------------------------------------------------------------------------------------
+
+void n64net_input::ResyncSend(uint8_t what, const uint8_t *body, uint32_t len) {
+    uint8_t buf[N64NET_INPUT_MAX_PACKET];
+    Writer w{buf};
+    w.U32(N64NET_INPUT_MAGIC);
+    w.U8(kVersion);
+    w.U8(kTypeResync);
+    w.U8((uint8_t)cfg.local_player);
+    w.U8(what);
+    w.U32(cfg.session_id);
+    w.U32(what == kRsDone ? rs.done_id : rs.id);
+    memcpy(w.p, body, len);
+    w.p += len;
+    w.U32(Fnv(buf, (uint32_t)(w.p - buf)));
+    Send(buf, (uint32_t)(w.p - buf));
+}
+
+void n64net_input::ResyncFail(const char *why) {
+    Log("n64net input: resync %u failed: %s\n", rs.id, why);
+    rs.failed = true;
+    rs.active = false;
+    rs.buf.clear();
+    rs.buf.shrink_to_fit();
+}
+
+void n64net_input::ResyncMaybeStart() {
+    if (!rs.enabled || !rs.host || !desynced || rs.active || rs.failed) return;
+    if (rs.started >= kRsMaxPerMatch) {
+        ResyncFail("too many desyncs in this match");
+        return;
+    }
+    // past every machine's present: a peer runs at most window + delay ticks past our newest input
+    ResyncBegin(rs.id + 1, last_sample_tick + Window() + delay + kRsMargin);
+    Log("n64net input: resync %u: every machine holds at tick %u (desync at %u)\n", rs.id, rs.hold, desync_tick);
+}
+
+void n64net_input::ResyncBegin(uint32_t id, uint32_t hold) {
+    rs.id = id;
+    rs.hold = hold;
+    rs.started++;
+    rs.active = true;
+    rs.have_mine = rs.compared = rs.total_known = false;
+    rs.progress_at = Now();
+    rs.repeat_at = 0;
+    rs.done_mask = 0;
+    rs.theirs.assign(rs.pieces, 0);
+    rs.hash_got.assign(rs.pieces, 0);
+    rs.piece_ok.assign(rs.pieces, 0);
+    rs.queued[0].assign(rs.pieces, 0);
+    rs.queued[1].assign(rs.pieces, 0);
+    rs.queue.clear();
+}
+
+void n64net_input::ResyncSaveMine() {
+    rs.buf.assign(rs.size, 0);
+    rs.save(rs.user, rs.buf.data());
+    rs.mine.resize(rs.pieces);
+    for (uint32_t i = 0; i < rs.pieces; i++) {
+        const uint32_t at = i * kRsPieceBytes;
+        rs.mine[i] = Fnv(rs.buf.data() + at, std::min(kRsPieceBytes, rs.size - at));
+    }
+    if (rs.host) rs.total = Fnv(rs.buf.data(), rs.size);
+    rs.have_mine = true;
+    rs.progress_at = Now();
+}
+
+void n64net_input::ResyncGuestStep() {
+    if (!rs.have_mine || !rs.total_known) return;
+    if (!rs.compared) {
+        for (uint32_t i = 0; i < rs.pieces; i++) if (!rs.hash_got[i]) return;
+        uint32_t differ = 0;
+        for (uint32_t i = 0; i < rs.pieces; i++) {
+            rs.piece_ok[i] = rs.mine[i] == rs.theirs[i];
+            differ += !rs.piece_ok[i];
+        }
+        rs.compared = true;
+        rs.repeat_at = 0;   // ask for the pieces now
+        Log("n64net input: resync %u: %u of %u pieces differ from the host's\n", rs.id, differ, rs.pieces);
+    }
+    for (uint32_t i = 0; i < rs.pieces; i++) if (!rs.piece_ok[i]) return;
+    if (Fnv(rs.buf.data(), rs.size) != rs.total) {   // (every piece was checked: shouldn't happen)
+        ResyncFail("the assembled state doesn't match the host's");
+        return;
+    }
+    rs.load(rs.user, rs.buf.data());
+    Log("n64net input: resync %u: the host's state is loaded at tick %u\n", rs.id, rs.hold);
+    rs.active = false;
+    rs.done++;
+    rs.done_id = rs.id;
+    rs.done_repeats = kRsDoneRepeats;
+    rs.done_at = 0;
+    ResetSync(rs.hold);
+    rs.buf.clear();
+    rs.buf.shrink_to_fit();
+}
+
+void n64net_input::ResyncServe() {
+    const uint64_t now = Now();
+    if (rs.done_repeats && now - rs.done_at >= 50000) {   // a guest: "loaded" (repeated: UDP)
+        uint8_t body[4];
+        Writer w{body};
+        w.U32(local_mask);
+        ResyncSend(kRsDone, body, 4);
+        rs.done_repeats--;
+        rs.done_at = now;
+    }
+    if (!rs.active) return;
+    const bool repeat = now - rs.repeat_at >= kRsRepeatUsecs;
+    if (repeat) rs.repeat_at = now;
+    if (rs.host) {
+        if (repeat) {
+            uint8_t body[8];
+            Writer w{body};
+            w.U32(rs.hold);
+            w.U32(rs.size);
+            ResyncSend(kRsHold, body, 8);
+        }
+        if (!rs.have_mine) return;
+        for (uint32_t n = 0; n < kRsPacketsPerServe && !rs.queue.empty(); n++) {
+            const uint32_t e = rs.queue.front();
+            rs.queue.pop_front();
+            const uint32_t kind = e >> 31, first = e & 0x7fffffffu;
+            uint8_t body[N64NET_INPUT_MAX_PACKET];
+            Writer w{body};
+            if (kind == 0) {
+                const uint32_t cnt = std::min(kRsHashesPerOffer, rs.pieces - first);
+                w.U32(rs.total);
+                w.U32(first);
+                w.U8((uint8_t)cnt);
+                for (uint32_t i = 0; i < cnt; i++) {
+                    w.U32(rs.mine[first + i]);
+                    rs.queued[0][first + i] = 0;
+                }
+                ResyncSend(kRsOffer, body, (uint32_t)(w.p - body));
+            } else {
+                rs.queued[1][first] = 0;
+                const uint32_t at = first * kRsPieceBytes, len = std::min(kRsPieceBytes, rs.size - at);
+                w.U32(first);
+                memcpy(w.p, rs.buf.data() + at, len);
+                w.p += len;
+                ResyncSend(kRsPiece, body, (uint32_t)(w.p - body));
+            }
+        }
+        return;
+    }
+    // a guest: ask for what's missing (hashes first, then the pieces that differ)
+    if (!repeat) return;
+    const bool want_hashes = !rs.compared;
+    const std::vector<uint8_t> &have = want_hashes ? rs.hash_got : rs.piece_ok;
+    uint8_t body[N64NET_INPUT_MAX_PACKET];
+    Writer w{body};
+    w.U8(want_hashes ? 0 : 1);
+    uint8_t *count_at = w.p;
+    w.U8(0);
+    uint32_t ranges = 0;
+    for (uint32_t i = 0; i < rs.pieces && ranges < kRsRangesPerNeed;) {
+        if (have[i]) { i++; continue; }
+        uint32_t j = i;
+        while (j < rs.pieces && !have[j] && j - i < 0xffff) j++;
+        w.U32(i);
+        w.U16((uint16_t)(j - i));
+        ranges++;
+        i = j;
+    }
+    if (ranges == 0) return;   // (all hashes in, own state not saved yet)
+    *count_at = (uint8_t)ranges;
+    ResyncSend(kRsNeed, body, (uint32_t)(w.p - body));
+}
+
+void n64net_input::ResyncHandle(Reader &r, uint8_t player, uint8_t what) {
+    if (!rs.enabled) return;
+    const uint32_t id = r.U32();
+    if (what == kRsHold) {
+        const uint32_t hold = r.U32(), size = r.U32();
+        if (!r.ok || rs.host || id <= rs.id) return;   // (repeats of one already handled)
+        if (size != rs.size) {
+            rs.id = id;
+            ResyncFail("the host's state has another size");
+            return;
+        }
+        ResyncBegin(id, hold);
+        Log("n64net input: resync %u: the host holds every machine at tick %u\n", id, hold);
+        if (last_sample_tick >= hold && local_started) ResyncFail("this machine is already past the hold tick");
+        return;
+    }
+    if (what == kRsDone) {
+        const uint32_t mask = r.U32();
+        if (r.ok && rs.host && rs.active && id == rs.id) rs.done_mask |= mask;
+        return;
+    }
+    if (!rs.active || id != rs.id) return;
+    if (what == kRsNeed && rs.host) {
+        const uint32_t kind = r.U8() ? 1 : 0, n = r.U8();
+        for (uint32_t k = 0; k < n && r.ok; k++) {
+            const uint32_t first = r.U32(), cnt = r.U16();
+            if (!r.ok) break;
+            for (uint32_t i = first; i < first + cnt && i < rs.pieces; i++) {
+                if (kind == 0) {   // offers carry kRsHashesPerOffer hashes from their first piece
+                    if (rs.queued[0][i]) continue;
+                    const uint32_t end = std::min(rs.pieces, i + kRsHashesPerOffer);
+                    for (uint32_t j = i; j < end; j++) rs.queued[0][j] = 1;
+                    rs.queue.push_back(i);
+                    i = end - 1;
+                } else if (!rs.queued[1][i]) {
+                    rs.queued[1][i] = 1;
+                    rs.queue.push_back(0x80000000u | i);
+                }
+            }
+        }
+        return;
+    }
+    if (rs.host) return;
+    if (what == kRsOffer) {
+        const uint32_t total = r.U32(), first = r.U32(), n = r.U8();
+        if (!r.ok) return;
+        rs.total = total;
+        rs.total_known = true;
+        for (uint32_t i = 0; i < n && first + i < rs.pieces; i++) {
+            const uint32_t h = r.U32();
+            if (!r.ok) break;
+            rs.theirs[first + i] = h;
+            rs.hash_got[first + i] = 1;
+        }
+        rs.progress_at = Now();
+        ResyncGuestStep();
+    } else if (what == kRsPiece) {
+        const uint32_t piece = r.U32();
+        if (!r.ok || piece >= rs.pieces || !rs.have_mine || !rs.compared || rs.piece_ok[piece]) return;
+        const uint32_t at = piece * kRsPieceBytes, len = std::min(kRsPieceBytes, rs.size - at);
+        if ((uint32_t)(r.end - r.p) != len || Fnv(r.p, len) != rs.theirs[piece]) return;
+        memcpy(rs.buf.data() + at, r.p, len);
+        rs.piece_ok[piece] = 1;
+        rs.progress_at = Now();
+        ResyncGuestStep();
+    }
+    (void)player;
+}
+
+void n64net_resync_enable(n64net_input *net, int is_host, uint32_t state_size,
+                          void (*save)(void *user, uint8_t *out), void (*load)(void *user, const uint8_t *in),
+                          void *user) {
+    net->rs.enabled = state_size > 0 && save && load;
+    net->rs.host = is_host != 0;
+    net->rs.size = state_size;
+    net->rs.pieces = (state_size + kRsPieceBytes - 1) / kRsPieceBytes;
+    net->rs.save = save;
+    net->rs.load = load;
+    net->rs.user = user;
+}
+
+int n64net_resync_hold(n64net_input *net, uint32_t tick) {
+    n64net_input::Resync &rs = net->rs;
+    if (!rs.enabled) return 0;
+    net->ResyncMaybeStart();
+    if (!rs.active) {
+        net->ResyncServe();   // (a guest's "done" repeats)
+        return 0;
+    }
+    if (net->Now() - rs.progress_at > kRsStallUsecs) {
+        net->ResyncFail("no progress for 20 s");
+        return 0;
+    }
+    if (tick < rs.hold) {
+        net->ResyncServe();
+        return 0;
+    }
+    if (tick > rs.hold) {
+        net->ResyncFail("this machine went past the hold tick");
+        return 0;
+    }
+    // at the hold: this machine's state once nothing before the hold can change any more
+    if (!rs.have_mine && net->MinNextNeeded() >= rs.hold && !net->rollback_pending) net->ResyncSaveMine();
+    if (rs.host) {
+        const uint32_t need = net->ResyncNeededMask();
+        if (rs.have_mine && (need & ~rs.done_mask) == 0) {
+            net->Log("n64net input: resync %u done: every machine has the host's state of tick %u\n", rs.id, rs.hold);
+            rs.active = false;
+            rs.done++;
+            net->ResetSync(rs.hold);
+            rs.buf.clear();
+            rs.buf.shrink_to_fit();
+            return 0;
+        }
+    } else {
+        net->ResyncGuestStep();
+        if (!rs.active) return 0;
+    }
+    net->ResyncServe();
+    if (net->Now() - net->last_send_usecs >= 10000) net->SendInputs();
+    return 1;
+}
+
+int n64net_resync_status(n64net_input *net, uint32_t *hold_tick, uint32_t *done) {
+    n64net_input::Resync &rs = net->rs;
+    if (done) *done = rs.done;
+    if (hold_tick) *hold_tick = rs.active ? rs.hold : 0;
+    if (rs.failed) return 2;
+    if (rs.active) return 1;
+    // a guest whose host never starts one (an older build, or it doesn't see the desync)
+    if (net->desynced && rs.enabled && !rs.host && net->Now() - net->desync_seen_at > kRsNoHostUsecs) return 2;
+    if (net->desynced && !rs.enabled) return 2;
+    return 0;
 }
