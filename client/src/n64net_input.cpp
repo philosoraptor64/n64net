@@ -1944,6 +1944,9 @@ void n64net_input::ResyncGuestStep() {
         return;
     }
     rs.load(rs.user, rs.buf.data());
+    // the rollback driver's saved states are from the old timeline: none may be loaded again (the port's next
+    // n64net_rollback_frame at the hold saves the loaded state)
+    slot_tick.assign(slot_tick.size(), kNoTick);
     Log("n64net input: resync %u: the host's state is loaded at tick %u\n", rs.id, rs.hold);
     rs.active = false;
     rs.done++;
