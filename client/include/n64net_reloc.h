@@ -10,16 +10,17 @@
  *  - A word whose value lies in a known region (the game library's image, or a memory pool the port registers)
  *    goes as "region r + offset". The header carries the host's region starts, so its original value is known
  *    too.
- *  - A word whose value lies elsewhere in mapped memory ("foreign": the heap, system libraries: an asset the
- *    game loaded, say) goes with a mark and its value.
+ *  - A word whose value lies elsewhere in the heap ("foreign": an asset the game loaded, say) goes with a mark
+ *    and its value. (A port whose state has no such pointers sets no_foreign: then those are plain data.)
+ *  - Register i64's game memory arena as a region in every port: it sits at one fixed address on every device, so
+ *    pointers into it mean the same thing there (as "foreign" the guest would keep its own).
  *  - Anything else goes as it is.
  *
  * Both devices encode their own state the same way, so the parts that are in step come out equal and n64net only
  * sends the pieces that differ. The guest then decides word by word, with its own word G beside the host's:
  *  - the same meaning (same encoding): G stays;
  *  - host "region r + off": G stays if it equals the host's original value (data that only looked like a
- *    pointer there); otherwise the guest's own address for r + off, unless G is plain data (then the host's value
- *    is data too);
+ *    pointer there); otherwise the guest's own address for r + off;
  *  - host foreign H: G stays if equal; else the guest's address for the same thing if it is known (from other
  *    places where the host has H and the guest a foreign word of its own: an asset pointer appears in pieces
  *    that are in step too); else G if it is foreign itself (a pointer of this device); else H (data);
@@ -74,6 +75,9 @@ typedef struct {
     int num_regions;
     n64net_reloc_range keep[N64NET_RELOC_MAX_KEEP];   /* per-device memory: not sent, not overwritten */
     int num_keep;
+    /* 1: this game's state holds no pointers outside its regions (GoldenEye: everything is in i64's fixed arena),
+     * so words that look like pointers elsewhere are data and always take the host's value */
+    int no_foreign;
     uint8_t uuid[16];
     /* mapped memory of this process (sorted), refreshed by n64net_reloc_scan */
     n64net_reloc_range *vm;
@@ -173,13 +177,16 @@ static inline void n64net_reloc_scan(n64net_reloc *r) {
     r->num_vm = 0;
     for (;;) {
         vm_size_t sz = 0;
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        vm_region_extended_info_data_t info;
+        mach_msg_type_number_t cnt = VM_REGION_EXTENDED_INFO_COUNT;
         mach_port_t obj = MACH_PORT_NULL;
-        if (vm_region_64(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) !=
+        if (vm_region_64(mach_task_self(), &a, &sz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info, &cnt, &obj) !=
             KERN_SUCCESS)
             break;
-        if (info.protection != VM_PROT_NONE) {
+        /* heap only: malloc's regions (tags 1-12) and plain anonymous memory (tag 0). Not the system's shared
+         * libraries, stacks, IOKit/GPU memory: game state doesn't point there, and their huge ranges made
+         * ordinary numbers (a seed, two small ints) look like pointers. */
+        if (info.protection != VM_PROT_NONE && info.user_tag <= 12 && info.share_mode != SM_SHARED) {
             if (r->num_vm && r->vm[r->num_vm - 1].hi == a) {
                 r->vm[r->num_vm - 1].hi = a + sz;
             } else {
@@ -237,7 +244,7 @@ static inline uint64_t n64net_reloc_enc_(const n64net_reloc *r, uint64_t w, n64n
         st->region_ptrs++;
         return (N64NET_RELOC_TAG_REGION << 48) | ((uint64_t)i << 44) | (w - r->region[i].lo);
     }
-    if (n64net_reloc_mapped_(r, w)) {
+    if (!r->no_foreign && n64net_reloc_mapped_(r, w)) {
         st->foreign++;
         return (N64NET_RELOC_TAG_FOREIGN << 48) | w;
     }
@@ -396,13 +403,12 @@ static inline int n64net_reloc_load(const n64net_reloc *r, const n64net_reloc_sp
                         st->same++;
                         continue;
                     }
-                    if (g == 0 || tmp.region_ptrs || tmp.foreign) {   /* a pointer field here too */
-                        w = r->region[kind].lo + off;
-                        st->translated++;
-                    } else {
-                        w = h.region_lo[kind] + off;   /* plain data here: the host's value is data too */
-                        st->guessed++;
-                    }
+                    /* a pointer: this device's address for it. (Where this device has plain data instead, the
+                     * memory differs here altogether, and the host's word is far more likely a real pointer than a
+                     * number that happens to look like one: a wrong pointer would crash, a wrong number would not.) */
+                    w = r->region[kind].lo + off;
+                    if (g == 0 || tmp.region_ptrs || tmp.foreign) st->translated++;
+                    else st->guessed++;
                 } else if (top == N64NET_RELOC_TAG_FOREIGN) {
                     const uint64_t hv = e & ((1ull << 48) - 1);
                     n64net_reloc_pair_ *q = pairs ? n64net_reloc_find_(pairs, mask, hv) : NULL;
