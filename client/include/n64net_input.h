@@ -286,6 +286,9 @@ void n64net_resync_enable(n64net_input *net, int is_host, uint32_t state_size,
                           void (*save)(void *user, uint8_t *out), void (*load)(void *user, const uint8_t *in),
                           void *user);
 int n64net_resync_hold(n64net_input *net, uint32_t tick);
+/* Host: start a resync without a desync (tests: a resync of states in step must find 0 pieces differing; later:
+ * bringing a machine in). It counts toward the 3 per match. 0 = not possible (not the host, off, failed). */
+int n64net_resync_request(n64net_input *net);
 /* 0: none going, 1: one in progress (hold tick in *hold_tick), 2: the last one failed (end the match).
  * *done: resyncs completed in this match. Either pointer may be NULL. */
 int n64net_resync_status(n64net_input *net, uint32_t *hold_tick, uint32_t *done);

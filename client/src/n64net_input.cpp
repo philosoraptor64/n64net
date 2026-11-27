@@ -298,11 +298,12 @@ struct n64net_input {
     uint32_t desync_tick = 0;
     uint8_t desync_kind = 0;
     uint32_t sync_matched = 0;
-    uint32_t sync_from = 0;          // sync checks of earlier ticks are ignored (a resync replaced that state)
+    uint32_t sync_from = 0;          // sync checks before this tick are ignored (a resync replaced that state)
     uint64_t desync_seen_at = 0;
     void ResetSync(uint32_t from) {
         desynced = false;
-        sync_from = from;
+        // the hold tick's own check too: a machine may have recorded it before it loaded the host's state
+        sync_from = from + 1;
         local_sync_count = 0;
         for (uint32_t &c : remote_sync_count) c = 0;
     }
@@ -314,7 +315,7 @@ struct n64net_input {
         void (*save)(void *, uint8_t *) = nullptr;
         void (*load)(void *, const uint8_t *) = nullptr;
         void *user = nullptr;
-        bool active = false, failed = false;
+        bool active = false, failed = false, requested = false;
         uint32_t id = 0, hold = kNoTick, started = 0, done = 0;
         uint64_t progress_at = 0, repeat_at = 0;
         bool have_mine = false, compared = false, total_known = false;
@@ -1885,7 +1886,8 @@ void n64net_input::ResyncFail(const char *why) {
 }
 
 void n64net_input::ResyncMaybeStart() {
-    if (!rs.enabled || !rs.host || !desynced || rs.active || rs.failed) return;
+    if (!rs.enabled || !rs.host || !(desynced || rs.requested) || rs.active || rs.failed) return;
+    rs.requested = false;
     if (rs.started >= kRsMaxPerMatch) {
         ResyncFail("too many desyncs in this match");
         return;
@@ -2110,6 +2112,12 @@ void n64net_resync_enable(n64net_input *net, int is_host, uint32_t state_size,
     net->rs.save = save;
     net->rs.load = load;
     net->rs.user = user;
+}
+
+int n64net_resync_request(n64net_input *net) {
+    if (!net->rs.enabled || !net->rs.host || net->rs.failed) return 0;
+    net->rs.requested = true;
+    return 1;
 }
 
 int n64net_resync_hold(n64net_input *net, uint32_t tick) {

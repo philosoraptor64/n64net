@@ -26,6 +26,7 @@ int main(void) {
         g_data[i] = i * 12345;
     }
     g_data[5] = (long)(0xFA11ull << 48 | 5);   /* data that looks like a mark */
+    host.mark_foreign = guest.mark_foreign = 1;
     n64net_reloc_add(&host, g_pool_a, sizeof g_pool_a);
     n64net_reloc_add(&guest, g_pool_b, sizeof g_pool_b);   /* the "guest" has its pool elsewhere */
     n64net_reloc_scan(&host);

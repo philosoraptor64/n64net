@@ -7,12 +7,14 @@
  *  - The state is a list of spans (the port's snapshot ranges). It is read as 8-byte words.
  *  - A word that points into a known region (this game library's own image, or a memory pool the port
  *    registers) becomes "region r + offset". The guest turns it back into an address in its own copy.
- *  - A word that points anywhere else in mapped memory (the heap outside the pools, system libraries: assets,
- *    caches) is "foreign": it can't be translated, so it is sent as a mark and the guest keeps its own word
- *    there. That is right as long as both devices hold the same thing at that place (the usual case: the same
- *    asset loaded on both); n64net_reloc_survey lists those words, to check a port.
- *  - Anything else is plain data and goes as it is. (Raw data that happens to look like a mark is rare; the
- *    guest keeps its own word there and it is counted.)
+ *  - Anything else goes as it is. That includes words that point elsewhere in mapped memory ("foreign": the heap
+ *    outside the pools, system libraries). Those can't be translated; but most words that look like that are
+ *    really data (a float of 3000.0 next to a count of 1 reads as 0x1453b8000, inside the heap), so they must
+ *    not be guessed at. A port whose state does hold heap pointers registers that memory as a pool; to find
+ *    them, resync two devices in step (n64net_resync_request) and compare (n64net_reloc_survey lists the
+ *    foreign-looking words). mark_foreign = 1 instead sends them as a mark and the guest keeps its own word.
+ *  - Raw data that happens to look like a mark (top 16 bits 0xFA11) is rare; the guest keeps its own word there
+ *    and it is counted.
  *
  * Both devices translate their own state the same way, so the parts that are in step come out byte for byte
  * equal and n64net only sends the pieces that differ.
@@ -59,6 +61,7 @@ typedef struct {
 typedef struct {
     n64net_reloc_range region[N64NET_RELOC_MAX_REGIONS];
     int num_regions;
+    int mark_foreign;   /* 0 (default): foreign-looking words go as they are (see above) */
     uint8_t uuid[16];
     /* mapped memory of this process (sorted), refreshed by n64net_reloc_scan */
     n64net_reloc_range *vm;
@@ -66,7 +69,8 @@ typedef struct {
 } n64net_reloc;
 
 typedef struct {
-    uint64_t words, region_ptrs, foreign, escaped;  /* save and load */
+    uint64_t words, region_ptrs, foreign, escaped;  /* save and load (foreign: words that look like pointers
+                                                       elsewhere; marked only with mark_foreign) */
     uint64_t own_kept, bad;                          /* load: foreign/escaped words kept from this device; marks
                                                         that couldn't be turned back (out of range) */
 } n64net_reloc_stats;
@@ -205,6 +209,7 @@ static inline uint64_t n64net_reloc_enc_(const n64net_reloc *r, uint64_t w, n64n
     }
     if (n64net_reloc_mapped_(r, w)) {
         st->foreign++;
+        if (!r->mark_foreign) return w;
         return (N64NET_RELOC_TAG << 48) | ((uint64_t)N64NET_RELOC_KIND_FOREIGN << 44);
     }
     return w;
