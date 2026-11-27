@@ -254,8 +254,9 @@ static inline int n64net_reloc_keep_in_(const n64net_reloc *r, int k, uint64_t l
     return 1;
 }
 
-/* Write the spans' portable form into out (n64net_reloc_state_size bytes). */
-static inline void n64net_reloc_save(const n64net_reloc *r, const n64net_reloc_span *s, int n, uint8_t *out,
+/* Write the spans' portable form into out (n64net_reloc_state_size bytes). Returns 0 if a span's used size is
+ * over its room: the state is then marked unusable (a guest refuses it) rather than cut short. */
+static inline int n64net_reloc_save(const n64net_reloc *r, const n64net_reloc_span *s, int n, uint8_t *out,
                                      n64net_reloc_stats *st) {
     n64net_reloc_header h;
     n64net_reloc_stats dummy;
@@ -269,9 +270,15 @@ static inline void n64net_reloc_save(const n64net_reloc *r, const n64net_reloc_s
     h.num_regions = (uint32_t)r->num_regions;
     memcpy(h.uuid, r->uuid, 16);
     for (i = 0; i < r->num_regions; i++) h.region_lo[i] = r->region[i].lo;
-    for (i = 0; i < n && i < N64NET_RELOC_MAX_SPANS; i++) {
+    for (i = 0; i < n; i++)
+        if (s[i].used > s[i].cap || n > N64NET_RELOC_MAX_SPANS) {
+            memset(&h, 0, sizeof(h));
+            memcpy(out, &h, sizeof(h));
+            return 0;
+        }
+    for (i = 0; i < n; i++) {
         const size_t cap = (s[i].cap + 7) & ~(size_t)7;
-        const size_t used = s[i].used < s[i].cap ? s[i].used : s[i].cap;
+        const size_t used = s[i].used;
         const size_t words = used / 8;
         const uint64_t *src = (const uint64_t *)s[i].base;
         const uint64_t lo = (uint64_t)(uintptr_t)s[i].base;
@@ -291,6 +298,7 @@ static inline void n64net_reloc_save(const n64net_reloc *r, const n64net_reloc_s
         p += cap;
     }
     memcpy(out, &h, sizeof(h));
+    return 1;
 }
 
 /* host foreign value -> this device's (load) */
@@ -443,8 +451,8 @@ static inline int n64net_reloc_add(n64net_reloc *r, const void *b, size_t n) { (
 static inline int n64net_reloc_keep(n64net_reloc *r, const void *b, size_t n) { (void)r; (void)b; (void)n; return 0; }
 static inline void n64net_reloc_scan(n64net_reloc *r) { (void)r; }
 static inline void n64net_reloc_free(n64net_reloc *r) { (void)r; }
-static inline void n64net_reloc_save(const n64net_reloc *r, const n64net_reloc_span *s, int n, uint8_t *out,
-                                     n64net_reloc_stats *st) { (void)r; (void)s; (void)n; (void)out; (void)st; }
+static inline int n64net_reloc_save(const n64net_reloc *r, const n64net_reloc_span *s, int n, uint8_t *out,
+                                    n64net_reloc_stats *st) { (void)r; (void)s; (void)n; (void)out; (void)st; return 0; }
 static inline int n64net_reloc_load(const n64net_reloc *r, const n64net_reloc_span *s, int n, const uint8_t *in,
                                     size_t *u, n64net_reloc_stats *st) { (void)r; (void)s; (void)n; (void)in; (void)u; (void)st; return 0; }
 
