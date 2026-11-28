@@ -64,6 +64,7 @@ constexpr uint32_t kLogPacketsPerSend = 16, kJoinNear = 60, kJoinMargin = 45;
 // A joiner watching (the live tick not known yet) plays paced while within kWatchNear ticks of the log's end and
 // fast-forwards again once more than kWatchFar behind (n64net_input_fast_forward).
 constexpr uint32_t kWatchNear = 8, kWatchFar = 90;
+constexpr uint64_t kJoinStallUsecs = 5000000;   // CheckJoinStall
 constexpr uint32_t kRejoinRepeats = 200;
 constexpr uint32_t kRetireTail = 64;      // the leaver's last inputs carried in a RETIRE packet
 constexpr uint32_t kRetireRepeats = 200;  // RETIRE packets sent with the next inputs (UDP: no ack needed)
@@ -243,6 +244,8 @@ struct n64net_input {
         bool heard = false;         // its game runs (a "have" arrived): until then one piece now and then
         bool hold = false;          // n64net_input_hold_join: it watches; no live tick until let in
         uint32_t rejoin_tick = kNoTick;   // its players' live tick, once announced
+        uint32_t stall_have = kNoTick;    // CheckJoinStall: "have" when it last moved, since when, last line logged
+        uint64_t stall_since = 0, stall_logged_at = 0;
     };
     std::vector<Joiner> joiners;
     uint32_t hold_next = 0;         // players whose coming join starts held (n64net_input_hold_join before add)
@@ -263,6 +266,10 @@ struct n64net_input {
     uint64_t have_sent_at = 0;
     uint32_t have_sent = 0;
     void SendHave(bool force);
+    // a catch-up that stops moving for kJoinStallUsecs logs what each side has (both sides; again every 5 s)
+    void CheckJoinStall(uint64_t now);
+    uint32_t stall_log_end = kNoTick, stall_played = kNoTick;
+    uint64_t stall_since = 0, stall_logged_at = 0;
     void HandleLog(Reader &r, uint8_t count, bool ext);
     bool CatchingUp() const { return cfg.joining && (live_from == kNoTick || log_end < live_from); }
     bool FromLog(uint32_t tick) const { return cfg.joining && (live_from == kNoTick || tick < live_from); }
@@ -601,6 +608,52 @@ void n64net_input::SendInputs() {
     ServeJoiner();
     if (CatchingUp()) SendHave(false);
     last_send_usecs = Now();
+    CheckJoinStall(last_send_usecs);
+}
+
+// A catch-up that stops moving leaves a line in the log on both sides (the one freeze of the 2026-11-21 weekend
+// left no evidence). Joiner: log ticks received, ticks played, the live tick. Host: per joiner, the log ticks it
+// has, sent and the host's log end. Logged after 5 s without progress, then every 5 s, plus one line when it moves.
+void n64net_input::CheckJoinStall(uint64_t now) {
+    static const auto tick_str = [](uint32_t t, char *buf, size_t n) -> const char * {
+        if (t == kNoTick) return "not known yet";
+        snprintf(buf, n, "%u", t);
+        return buf;
+    };
+    char live[16];
+    if (CatchingUp()) {
+        const uint32_t played = last_sample_tick;
+        if (log_end != stall_log_end || played != stall_played) {
+            if (stall_logged_at) Log("n64net input: catch-up moving again (log %u, played %u)\n", log_end, played);
+            stall_log_end = log_end;
+            stall_played = played;
+            stall_since = now;
+            stall_logged_at = 0;
+        } else if (now - stall_since >= kJoinStallUsecs && now - stall_logged_at >= kJoinStallUsecs) {
+            Log("n64net input: catch-up stalled %.0f s: log ticks received up to %u, played up to %u, live tick %s%s\n",
+                (now - stall_since) / 1e6, log_end, played, tick_str(live_from, live, sizeof(live)),
+                played + 1 < log_end ? " (the log is there: the game isn't playing it)" : " (waiting for the host's log)");
+            stall_logged_at = now;
+        }
+    } else {
+        stall_log_end = stall_played = kNoTick;
+        stall_logged_at = 0;
+    }
+    for (Joiner &j : joiners) {
+        if (j.have != j.stall_have) {
+            if (j.stall_logged_at) Log("n64net input: the joiner (players %x) moves again (it has %u)\n", j.mask, j.have);
+            j.stall_have = j.have;
+            j.stall_since = now;
+            j.stall_logged_at = 0;
+        } else if (j.have < log_end && now - j.stall_since >= kJoinStallUsecs &&
+                   now - j.stall_logged_at >= kJoinStallUsecs) {
+            Log("n64net input: the joiner (players %x) stalled %.0f s: it has the log up to %u, sent up to %u, log end %u, "
+                "live tick %s%s%s\n", j.mask, (now - j.stall_since) / 1e6, j.have, j.sent, log_end,
+                tick_str(j.rejoin_tick, live, sizeof(live)), j.heard ? "" : ", its game hasn't answered yet",
+                j.hold ? ", watching" : "");
+            j.stall_logged_at = now;
+        }
+    }
 }
 
 // One local player's stream: its inputs from the oldest tick any peer still needs, as many as fit.
