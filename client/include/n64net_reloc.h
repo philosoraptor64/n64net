@@ -60,6 +60,8 @@ extern "C" {
 #define N64NET_RELOC_TAG_FOREIGN 0xFA12ull
 #define N64NET_RELOC_KIND_ESCAPE 14
 #define N64NET_RELOC_MAGIC 0x324C3634u /* "64L2" */
+/* align4: room for region pointers found 4 bytes into a word (packed structs), listed after the spans */
+#define N64NET_RELOC_MAX_SPLIT 65536
 
 typedef struct {
     uint64_t lo, hi;
@@ -71,7 +73,7 @@ typedef struct {
     size_t cap;    /* room for it (the same on every device) */
 } n64net_reloc_span;
 
-typedef struct {
+typedef struct n64net_reloc_ {
     n64net_reloc_range region[N64NET_RELOC_MAX_REGIONS];
     int num_regions;
     n64net_reloc_range keep[N64NET_RELOC_MAX_KEEP];   /* per-device memory: not sent, not overwritten */
@@ -81,6 +83,11 @@ typedef struct {
     int no_foreign;
     /* 1: a word the host has in a region is always translated, even where this device has plain data there */
     int translate_always;
+    /* 1: also find region pointers 4 bytes into a word (packed structs: Perfect Dark's model and audio data). The
+     * state then ends with a list of them (n64net_reloc_state_size_r); the span bytes there stay the host's raw
+     * bytes, and the guest decides for each one as for a region word. 2: also 2 and 6 bytes into a word (structs
+     * packed to 2 bytes: Perfect Dark's converted sound banks). */
+    int align4;
     uint8_t uuid[16];
     /* mapped memory of this process (sorted), refreshed by n64net_reloc_scan */
     n64net_reloc_range *vm;
@@ -90,6 +97,7 @@ typedef struct {
 typedef struct {
     uint64_t words, region_ptrs, foreign, escaped;   /* save; load: the host's words of each kind */
     uint64_t same, translated, own_pointer, matched, guessed;
+    uint64_t split;   /* align4: save: pointers 4 bytes into a word found; load: the host's ones */
     /* load: kept (same meaning or the same value); turned into this device's address; host's foreign word, this
      * device's own pointer kept; host's foreign word turned into this device's (seen elsewhere); host's word
      * taken where this device had something else entirely (diverged memory: a best guess) */
@@ -97,7 +105,7 @@ typedef struct {
 
 /* the fixed header in front of the spans */
 typedef struct {
-    uint32_t magic, num_spans, num_regions, pad;
+    uint32_t magic, num_spans, num_regions, num_split;   /* num_split: align4 entries after the spans */
     uint8_t uuid[16];
     uint64_t used[N64NET_RELOC_MAX_SPANS];
     uint64_t region_lo[N64NET_RELOC_MAX_REGIONS];
@@ -109,6 +117,17 @@ static inline size_t n64net_reloc_state_size(const n64net_reloc_span *s, int n) 
     int i;
     for (i = 0; i < n; i++) t += (s[i].cap + 7) & ~(size_t)7;
     return t;
+}
+
+/* one align4 entry: the pointer's place (span, byte offset) and where it points (region, offset) */
+typedef struct {
+    uint32_t span, kind;
+    uint64_t at, off;
+} n64net_reloc_split_;
+
+/* n64net_reloc_state_size with this device's options (align4 adds the list) */
+static inline size_t n64net_reloc_state_size_r(const struct n64net_reloc_ *r, const n64net_reloc_span *s, int n) {
+    return n64net_reloc_state_size(s, n) + (r->align4 ? N64NET_RELOC_MAX_SPLIT * sizeof(n64net_reloc_split_) : 0);
 }
 
 #ifdef __APPLE__
@@ -307,6 +326,52 @@ static inline int n64net_reloc_save(const n64net_reloc *r, const n64net_reloc_sp
         st->words += words;
         p += cap;
     }
+    if (r->align4) {   /* region pointers 4 bytes into a word, where neither word around it is one itself */
+        n64net_reloc_split_ *list = (n64net_reloc_split_ *)p;
+        uint32_t ns = 0;
+        memset(list, 0, N64NET_RELOC_MAX_SPLIT * sizeof(*list));
+        for (i = 0; i < n; i++) {
+            const uint8_t *src = (const uint8_t *)s[i].base;
+            const size_t words = s[i].used / 8;
+            const size_t step = r->align4 >= 2 ? 2 : 4;
+            size_t at, j, next = 0;   /* next: past the last one found (they don't overlap) */
+            for (at = step; at + 8 <= words * 8; at += step) {
+                uint64_t w, w2, m;
+                n64net_reloc_stats t1, t2;
+                int kind, kk, kept = 0;
+                if (at % 8 == 0 || at < next) continue;
+                j = at / 8;
+                if (j + 1 >= words) break;
+                memcpy(&m, src + at, 8);
+                if (m < 0x100000000ull || (kind = n64net_reloc_region_of_(r, m)) < 0) continue;
+                memcpy(&w, src + j * 8, 8);
+                memcpy(&w2, src + j * 8 + 8, 8);
+                memset(&t1, 0, sizeof(t1));
+                memset(&t2, 0, sizeof(t2));
+                if (n64net_reloc_enc_(r, w, &t1) != w || n64net_reloc_enc_(r, w2, &t2) != w2 || t1.escaped || t2.escaped)
+                    continue;   /* an aligned pointer (or mark) there already */
+                for (kk = 0; kk < r->num_keep; kk++) {
+                    size_t a, b;
+                    const uint64_t pa = (uint64_t)(uintptr_t)src + at;
+                    if (n64net_reloc_keep_in_(r, kk, pa, pa + 8, &a, &b)) kept = 1;
+                }
+                if (kept) continue;
+                if (ns >= N64NET_RELOC_MAX_SPLIT) {   /* no room: unusable rather than half translated */
+                    memset(&h, 0, sizeof(h));
+                    memcpy(out, &h, sizeof(h));
+                    return 0;
+                }
+                list[ns].span = (uint32_t)i;
+                list[ns].kind = (uint32_t)kind;
+                list[ns].at = at;
+                list[ns].off = m - r->region[kind].lo;
+                ns++;
+                next = at + 8;
+            }
+        }
+        h.num_split = ns;
+        st->split = ns;
+    }
     memcpy(out, &h, sizeof(h));
     return 1;
 }
@@ -332,6 +397,7 @@ static inline int n64net_reloc_load(const n64net_reloc *r, const n64net_reloc_sp
     n64net_reloc_pair_ *pairs = NULL;
     size_t mask = 0, nforeign = 0;
     uint8_t *kept[N64NET_RELOC_MAX_KEEP];
+    uint64_t *gsplit = NULL;
     const uint8_t *p;
     int i, k, pass;
     if (!st) st = &dummy;
@@ -342,6 +408,18 @@ static inline int n64net_reloc_load(const n64net_reloc *r, const n64net_reloc_sp
         return 0;
     for (i = 0; i < n; i++)
         if (h.used[i] > s[i].cap) return 0;
+    if ((h.num_split && !r->align4) || h.num_split > N64NET_RELOC_MAX_SPLIT) return 0;
+    if (h.num_split) {   /* every entry must lie inside its span */
+        const n64net_reloc_split_ *list = (const n64net_reloc_split_ *)(in + n64net_reloc_state_size(s, n));
+        uint32_t e;
+        for (e = 0; e < h.num_split; e++)
+            if (list[e].span >= (uint32_t)n || list[e].at + 8 > h.used[list[e].span] || list[e].kind >= h.num_regions)
+                return 0;
+        gsplit = (uint64_t *)malloc(h.num_split * sizeof(uint64_t));
+        if (!gsplit) return 0;
+        for (e = 0; e < h.num_split; e++)   /* this device's own values there, before anything is written */
+            memcpy(&gsplit[e], (const uint8_t *)s[list[e].span].base + list[e].at, 8);
+    }
     /* pass 0: count the host's foreign words; pass 1: pair them with this device's own foreign words where the
      * two differ (one asset at different addresses); pass 2: write */
     for (pass = 0; pass < 3; pass++) {
@@ -446,6 +524,35 @@ static inline int n64net_reloc_load(const n64net_reloc *r, const n64net_reloc_sp
             }
             p += cap;
         }
+    }
+    if (gsplit) {   /* align4 entries: as a region word, against this device's own value there */
+        const n64net_reloc_split_ *list = (const n64net_reloc_split_ *)(in + n64net_reloc_state_size(s, n));
+        uint32_t e;
+        for (e = 0; e < h.num_split; e++) {
+            const uint64_t gm = gsplit[e], mine = r->region[list[e].kind].lo + list[e].off;
+            const uint64_t hp = h.region_lo[list[e].kind] + list[e].off;
+            n64net_reloc_stats tmp;
+            uint64_t w;
+            st->split++;
+            if (mine >= r->region[list[e].kind].hi) {
+                st->guessed++;
+                continue;
+            }
+            memset(&tmp, 0, sizeof(tmp));
+            (void)n64net_reloc_enc_(r, gm, &tmp);
+            if (gm == mine || gm == hp) {
+                st->same++;
+                w = gm;
+            } else if (gm == 0 || tmp.region_ptrs || tmp.foreign || r->translate_always) {
+                w = mine;
+                st->translated++;
+            } else {
+                st->guessed++;   /* plain data here: the host's bytes (already written) */
+                continue;
+            }
+            memcpy((uint8_t *)s[list[e].span].base + list[e].at, &w, 8);
+        }
+        free(gsplit);
     }
     for (k = 0; k < r->num_keep; k++) {
         if (kept[k]) {
